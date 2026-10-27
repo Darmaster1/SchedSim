@@ -38,7 +38,7 @@
 \title{\vspace{-1em}\fontsize{14.5}{16.5}\selectfont\bfseries Machine Learning-Assisted Priority Scheduling and\\Reinforcement Learning-Based Adaptive Round Robin:\\A Simulation Study with a Correlation-Guided Burst Predictor}
 
 \author{
-\normalsize Aaditya Kumar, Mohnish Tulsian, Achintya B S\\
+\normalsize Dr Sudhamani MJ, Aaditya Kumar, Mohnish Tulsian, Achintya B S\\
 \small Department of Computer Science and Engineering -- Artificial Intelligence and Machine Learning\\
 \small PES University, Bangalore, India
 }
@@ -70,7 +70,7 @@ We re-verified the central claims of a 2017 survey \cite{dias2017} against origi
 
 More recent dynamic-quantum RR work includes DABRR \cite{dash2016}, an effective-time-slice RR \cite{tajwar2017}, $k$-means-based RR \cite{mostafa2020}, and an agent-based adaptive RR compared against twelve baselines \cite{khan2025}. RL has been applied to real scheduler parameters by Han and Lee \cite{han2020} (Android's Energy-Aware Scheduler) and, in preprint form, to general adaptive resource scheduling \cite{li2024}. Within a necessarily limited search, we did not find a peer-reviewed study comparing fixed, rule-based, and Q-learning RR quantum selection together under shared tie-breaking rules while reporting worst-case waiting and starvation counts, nor a protected-vs-unprotected ML priority comparison reporting explicit inversion and starvation statistics -- the gap this study targets.
 
-\begin{table}[h]
+\begin{table*}[ht]
 \centering
 \caption{Positioning relative to closely related work.}
 \label{tab:related}
@@ -90,7 +90,7 @@ More recent dynamic-quantum RR work includes DABRR \cite{dash2016}, an effective
 \textbf{This work} & \textbf{5 ML models + rules + tabular Q-learning, 6-way} & \textbf{Worst-case, starvation, fairness, stat. tests, property-based verification} \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 \section{System Design}
 
@@ -196,7 +196,7 @@ We report the repository's default configuration: 25 processes/workload, 3 train
 \subsection{Burst Prediction and Tuned Parameters}
 Linear regression achieved the lowest validation RMSE and supplied predictions to every downstream algorithm. Validation-selected: $\alpha{=}0$ (Weighted ML reduces to shortest-predicted-burst-first on this mixture), $(W_{\max},G){=}(144.9,7)$, fixed RR quantum $q{=}40$.
 
-\begin{table}[h]
+\begin{table*}[ht]
 \centering
 \caption{Mean test-set outcomes across 65 paired workloads (lower is better except Jain's index and utilisation).}
 \label{tab:main}
@@ -215,7 +215,7 @@ E & 166.7 & 423.4 & 347.4 & 76.4 & 13.4 & 0.53 \\
 F & 228.3 & 591.2 & 495.4 & 234.4 & 15.5 & \textbf{0.70} \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 \begin{figure}[h]
 \centering
@@ -317,7 +317,7 @@ python run\_experiment.py --deep \quad\# 20k+ Q-learning episodes
 No part of the pipeline requires network access, proprietary data, or a license beyond the open-source dependencies in \texttt{requirements.txt} (NumPy, SciPy, scikit-learn, pandas, Hypothesis).
 
 \section*{Acknowledgment}
-The authors thank Dev Harshit for assistance with the plagiarism check on this manuscript.
+The authors thank Dr Sudhamani MJ for the plagiarism check on this manuscript, and for guiding and helping us throughout this work, as she is our professor and we are doing this under her supervision.
 
 \balance
 \begin{thebibliography}{9}

@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .schedulers import QUANTA, run_round_robin_family
+from .schedulers import DEFAULT_REWARD_WEIGHTS, QUANTA, run_round_robin_family
 from .workload import Process, WorkloadSpec, generate_workload
 
 N_ACTIONS = len(QUANTA)
@@ -44,11 +44,13 @@ def discretize_state(queue_len: int, mean_pred_remaining: float, max_wait: float
 
 N_STATES = 4 * 4 * 3 * 3  # 144
 
+#   r_t = -w1*dW/Wref - w2*Rfirst/Rref - w3*min(S-1,Smax)/Sref
+#        - w4*1[switch] - w5*clip((Wmax-Wfair)/Wfair, 0, 1)          (Eq. 7)
 WEIGHT_PRESETS = {
-    "balanced": dict(w_wait=1.0, w_response=0.1, w_slowdown=0.1, w_tailwait=0.2),
-    "wait_only": dict(w_wait=1.0, w_response=0.0, w_slowdown=0.0, w_tailwait=0.0),
-    "context_switch_heavy": dict(w_wait=0.7, w_response=0.1, w_slowdown=0.1, w_tailwait=0.2),
-    "fairness_heavy": dict(w_wait=0.6, w_response=0.1, w_slowdown=0.1, w_tailwait=0.6),
+    "balanced": dict(w1=1.0, w2=0.5, w3=0.5, w4=0.2, w5=0.2),
+    "wait_only": dict(w1=1.0, w2=0.0, w3=0.0, w4=0.0, w5=0.0),
+    "context_switch_heavy": dict(w1=0.7, w2=0.3, w3=0.3, w4=0.8, w5=0.2),
+    "fairness_heavy": dict(w1=0.6, w2=0.3, w3=0.3, w4=0.2, w5=0.8),
 }
 
 
@@ -86,6 +88,20 @@ class QLearningAgent:
         s = discretize_state(queue_len, mean_pred_remaining, max_wait, imbalance, own_wait)
         return self.select_action(s, explore=True)
 
+    # --- Resumable training: persist/restore the Q-table and cumulative
+    # episode count (so epsilon decay continues across process runs) ------
+    def save(self, path: str, cumulative_episodes: Optional[int] = None):
+        np.savez(path, q_table=self.q_table,
+                 cumulative_episodes=np.array(
+                     cumulative_episodes if cumulative_episodes is not None else self.episode))
+
+    @classmethod
+    def load(cls, path: str, seed: int = 0, eps_decay_episodes: int = 200) -> Tuple["QLearningAgent", int]:
+        data = np.load(path)
+        agent = cls(seed=seed, eps_decay_episodes=eps_decay_episodes, q_table=data["q_table"].copy())
+        cumulative_episodes = int(data["cumulative_episodes"])
+        return agent, cumulative_episodes
+
 
 @dataclass
 class FrozenQPolicy:
@@ -100,21 +116,61 @@ class FrozenQPolicy:
         return int(best[0])
 
 
+def _eval_agent_mean_waiting(agent: "QLearningAgent", eval_specs: List[WorkloadSpec],
+                              eval_seeds: List[int], predicted_lookup,
+                              context_switch_cost: float) -> float:
+    """Mean average-waiting-time of the agent's CURRENT greedy (frozen)
+    policy over a small fixed set of (spec, seed) evaluation workloads --
+    used only to trace a learning curve during training, never to update
+    the agent itself."""
+    from .metrics import compute_metrics  # local import avoids a cycle at module load
+    frozen = FrozenQPolicy(agent.q_table)
+    waits = []
+    for spec in eval_specs:
+        for seed in eval_seeds:
+            procs, predicted = predicted_lookup(spec, seed)
+            log = run_round_robin_family(procs, frozen, predicted, context_switch_cost)
+            waits.append(compute_metrics(procs, log).avg_waiting)
+    return float(np.mean(waits)) if waits else float("nan")
+
+
 def train_qlearning_agent(train_specs: List[WorkloadSpec], predicted_lookup,
                            n_episodes: int = 400, seed: int = 0,
                            weight_preset: str = "balanced",
-                           context_switch_cost: float = 1.0) -> QLearningAgent:
+                           context_switch_cost: float = 1.0,
+                           eval_every: int = 0,
+                           eval_specs: Optional[List[WorkloadSpec]] = None,
+                           eval_seeds: Optional[List[int]] = None,
+                           progress_every: int = 0,
+                           initial_q_table: Optional[np.ndarray] = None,
+                           cumulative_episode_offset: int = 0,
+                           eps_decay_episodes: Optional[int] = None) -> Tuple[QLearningAgent, List[dict]]:
     """Train one Q-learning agent over `n_episodes` sampled training workloads.
 
     `predicted_lookup(spec, seed) -> (procs, predicted_dict)` supplies the
     burst predictions each episode should use (out-of-fold predictions for
     training workloads, per Section 7.1).
+
+    If `eval_every > 0`, the agent's current greedy policy is evaluated on
+    `eval_specs` (defaults to `train_specs`) every `eval_every` episodes,
+    producing a learning curve: a list of
+    {"episode": int, "mean_avg_waiting": float, "epsilon": float} dicts,
+    returned as the second element of the result tuple. This is the
+    mechanism that lets training actually be watched "getting better" over
+    many iterations, the way a normal ML training loop is monitored, rather
+    than being a single opaque batch call.
     """
-    agent = QLearningAgent(seed=seed, eps_decay_episodes=max(1, n_episodes // 2))
+    decay = eps_decay_episodes if eps_decay_episodes is not None else max(1, int(n_episodes * 0.6))
+    agent = QLearningAgent(seed=seed, eps_decay_episodes=decay,
+                            q_table=initial_q_table.copy() if initial_q_table is not None else None)
     rng = random.Random(seed)
+    eval_specs = eval_specs if eval_specs is not None else train_specs
+    eval_seeds = eval_seeds if eval_seeds is not None else [987654]
+    weights = WEIGHT_PRESETS.get(weight_preset, DEFAULT_REWARD_WEIGHTS)
+    history: List[dict] = []
 
     for ep in range(n_episodes):
-        agent.episode = ep
+        agent.episode = cumulative_episode_offset + ep
         spec = rng.choice(train_specs)
         episode_seed = rng.randrange(1_000_000)
         procs, predicted = predicted_lookup(spec, episode_seed)
@@ -124,6 +180,17 @@ def train_qlearning_agent(train_specs: List[WorkloadSpec], predicted_lookup,
             ns_idx = None if (done or next_state is None) else discretize_state(**next_state)
             agent.update(s_idx, a_idx, reward, ns_idx)
 
-        run_round_robin_family(procs, agent, predicted, context_switch_cost, step_callback=cb)
+        run_round_robin_family(procs, agent, predicted, context_switch_cost, step_callback=cb,
+                                reward_weights=weights)
 
-    return agent
+        if eval_every and (ep + 1) % eval_every == 0:
+            score = _eval_agent_mean_waiting(agent, eval_specs, eval_seeds, predicted_lookup,
+                                              context_switch_cost)
+            history.append({"episode": ep + 1, "mean_avg_waiting": score,
+                             "epsilon": agent.epsilon()})
+        if progress_every and (ep + 1) % progress_every == 0:
+            last = history[-1]["mean_avg_waiting"] if history else float("nan")
+            print(f"    [qlearning] episode {ep+1}/{n_episodes}  "
+                  f"eps={agent.epsilon():.3f}  last_eval_avg_waiting={last:.2f}")
+
+    return agent, history

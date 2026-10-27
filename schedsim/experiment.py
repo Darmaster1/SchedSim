@@ -2,19 +2,18 @@
 Experiment orchestration: ties workload generation, burst prediction, the
 six scheduling algorithms, and metrics together into one reproducible run.
 
-This is a *scaled-down* but fully functional instance of the protocol
-described in the paper (Sections 6-11): smaller sample sizes and a smaller
-Q-learning training budget so that the whole pipeline runs in well under a
-minute on a laptop, while exercising every code path (leakage control,
-train/val/test separation, parameter tuning, statistical comparison).
-Scale up via the CLI flags in run_experiment.py for a fuller run.
+Every tunable algorithm (B's alpha, C's safeguard parameters, D's quantum,
+E's rule thresholds, F's Q-table) is optimised by an iterative search over
+many trials/episodes rather than a handful of fixed grid points, and each
+search records a trial-by-trial "best score so far" history -- so, just
+like a normal ML training run, you can watch every algorithm actually get
+better as the trial/episode budget increases. See `run_experiment.py` for
+how to scale these budgets up to tens of thousands of trials/episodes.
 """
 from __future__ import annotations
 
-import itertools
-import statistics
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -36,9 +35,25 @@ class ExperimentConfig:
     workloads_per_category_val: int = 2
     workloads_per_category_test: int = 4
     context_switch_cost: float = 1.0
+
+    # Algorithm F (Q-learning): training episode budget. This is the one
+    # that scales most dramatically -- set to 20_000-30_000 for a "deep"
+    # training run; see train_qlearning_agent's eval_every for the learning
+    # curve this produces.
     qlearning_episodes: int = 300
     qlearning_seed: int = 0
+    qlearning_eval_every: int = 0       # 0 disables learning-curve logging
+    qlearning_progress_every: int = 0   # 0 disables console progress prints
+
+    # Algorithms B, C, D, E: random-search trial budgets. Each of these
+    # also produces a "best score so far vs. trial number" history.
+    alpha_trials: int = 25
+    c_trials: int = 60
+    quantum_trials: int = 20
+    rule_trials: int = 120
+
     random_state: int = 0
+    verbose: bool = False
 
 
 def _seeds(spec_idx: int, split: str, count: int) -> List[int]:
@@ -88,94 +103,176 @@ def fit_burst_predictor(train_pool: dict, val_pool: dict):
     return best_name, best_fp, all_metrics
 
 
-def tune_alpha(val_pool: dict, fp) -> float:
-    best_alpha, best_score = 0.5, float("inf")
-    for alpha in np.arange(0.0, 1.01, 0.2):
-        waits = []
-        for lst in val_pool.values():
-            for procs, spec in lst:
-                predicted = _predicted_dict(procs, fp)
-                log = run_priority_family(procs, AlgorithmB_WeightedML(alpha), predicted)
-                m = compute_metrics(procs, log)
-                waits.append(m.avg_waiting)
-        score = float(np.mean(waits))
-        if score < best_score:
-            best_score, best_alpha = score, float(alpha)
-    return best_alpha
+# ---------------------------------------------------------------------------
+# Generic random-search helper: run `n_trials` randomly sampled candidates,
+# score each on the validation pool, and record a "best score so far" curve
+# -- the same monitoring pattern as a Q-learning learning curve, applied to
+# algorithms that are tuned by search rather than by gradient-style updates.
+# ---------------------------------------------------------------------------
 
-
-def tune_protected_c(val_pool: dict, fp, alpha: float) -> Tuple[float, int]:
-    """Select (W_max, gap) to minimise mean max-waiting, subject to mean
-    average waiting being <= 1.10x Algorithm B's. If NO grid point satisfies
-    the constraint (possible when B is already close to SJF-optimal), fall
-    back to the feasible-closest point -- the one with the smallest average
-    waiting -- rather than silently returning an untested default; the
-    constraint is a soft preference, not something to fake compliance with.
+def _random_search(n_trials: int, seed: int, sample_fn, score_fn, minimize=True):
+    """sample_fn(rng) -> candidate; score_fn(candidate) -> float.
+    Returns (best_candidate, best_score, history) where history is a list of
+    {"trial": int, "score": float, "best_so_far": float, "candidate": ...}.
     """
-    b_waits = []
+    rng = np.random.default_rng(seed)
+    best_candidate, best_score = None, float("inf") if minimize else -float("inf")
+    history = []
+    for t in range(n_trials):
+        cand = sample_fn(rng)
+        score = score_fn(cand)
+        improved = (score < best_score) if minimize else (score > best_score)
+        if improved:
+            best_score, best_candidate = score, cand
+        history.append({"trial": t + 1, "score": float(score),
+                         "best_so_far": float(best_score), "candidate": cand})
+    return best_candidate, best_score, history
+
+
+def _mean_metric(val_pool: dict, runner, metric: str) -> float:
+    vals = []
     for lst in val_pool.values():
         for procs, spec in lst:
+            log = runner(procs)
+            m = compute_metrics(procs, log)
+            vals.append(getattr(m, metric))
+    return float(np.mean(vals))
+
+
+# ---------------------------------------------------------------------------
+# Algorithm B: alpha (blend weight)
+# ---------------------------------------------------------------------------
+
+def tune_alpha_search(val_pool: dict, fp, n_trials: int = 25, seed: int = 0
+                       ) -> Tuple[float, List[dict]]:
+    def sample(rng):
+        return float(rng.uniform(0.0, 1.0))
+
+    def score(alpha):
+        def runner(procs):
             predicted = _predicted_dict(procs, fp)
-            log = run_priority_family(procs, AlgorithmB_WeightedML(alpha), predicted)
-            b_waits.append(compute_metrics(procs, log).avg_waiting)
-    b_avg = float(np.mean(b_waits))
+            return run_priority_family(procs, AlgorithmB_WeightedML(alpha), predicted)
+        return _mean_metric(val_pool, runner, "avg_waiting")
+
+    best_alpha, _, history = _random_search(n_trials, seed, sample, score)
+    # Always include the two informative endpoints (pure priority / pure SJF)
+    # and the midpoint, since a pure random search can otherwise miss them.
+    for alpha in (0.0, 0.5, 1.0):
+        s = score(alpha)
+        if s < history[-1]["best_so_far"]:
+            best_alpha = alpha
+        history.append({"trial": len(history) + 1, "score": float(s),
+                         "best_so_far": min(s, history[-1]["best_so_far"]), "candidate": alpha})
+        if history[-1]["best_so_far"] == s:
+            best_alpha = alpha
+    return best_alpha, history
+
+
+# ---------------------------------------------------------------------------
+# Algorithm C: (W_max, gap)
+# ---------------------------------------------------------------------------
+
+def tune_protected_c_search(val_pool: dict, fp, alpha: float, n_trials: int = 60,
+                             seed: int = 0) -> Tuple[Tuple[float, int], List[dict]]:
+    """As in the fixed-grid version, (W_max, gap) is chosen to minimise mean
+    max-waiting subject to mean average waiting <= 1.10x Algorithm B's; if no
+    sampled candidate satisfies the constraint, the feasible-closest
+    candidate (smallest average waiting) is used as a fallback rather than
+    an unvalidated default. With `n_trials` in the hundreds-to-thousands
+    range this covers the (W_max, gap) space far more thoroughly than a
+    16-point grid.
+    """
+    def runner_b(procs):
+        predicted = _predicted_dict(procs, fp)
+        return run_priority_family(procs, AlgorithmB_WeightedML(alpha), predicted)
+    b_avg = _mean_metric(val_pool, runner_b, "avg_waiting")
     limit = 1.10 * b_avg
 
+    def sample(rng):
+        w_max = float(rng.uniform(10.0, 150.0))
+        gap = int(rng.integers(0, 8))
+        return (w_max, gap)
+
     feasible_best, feasible_score = None, float("inf")
-    fallback_best, fallback_score = None, float("inf")  # smallest avg_wait seen, any constraint status
+    history = []
+    fallback_best, fallback_score = None, float("inf")
 
-    for w_max in (20.0, 40.0, 70.0, 100.0):
-        for gap in (1, 2, 3, 5):
-            c_waits, c_max = [], []
-            for lst in val_pool.values():
-                for procs, spec in lst:
-                    predicted = _predicted_dict(procs, fp)
-                    log = run_priority_family(procs, AlgorithmC_ProtectedML(alpha, w_max, gap), predicted)
-                    m = compute_metrics(procs, log)
-                    c_waits.append(m.avg_waiting)
-                    c_max.append(m.max_waiting)
-            mean_wait = float(np.mean(c_waits))
-            mean_max = float(np.mean(c_max))
+    rng = np.random.default_rng(seed)
+    for t in range(n_trials):
+        w_max, gap = sample(rng)
 
-            if mean_wait <= limit and mean_max < feasible_score:
-                feasible_score, feasible_best = mean_max, (w_max, gap)
-            if mean_wait < fallback_score:
-                fallback_score, fallback_best = mean_wait, (w_max, gap)
+        def runner_c(procs):
+            predicted = _predicted_dict(procs, fp)
+            return run_priority_family(procs, AlgorithmC_ProtectedML(alpha, w_max, gap), predicted)
 
-    return feasible_best if feasible_best is not None else fallback_best
-
-
-def tune_fixed_quantum(val_pool: dict) -> float:
-    best_q, best_score = QUANTA[1], float("inf")
-    for q in QUANTA:
-        waits = []
+        c_waits, c_max = [], []
         for lst in val_pool.values():
             for procs, spec in lst:
-                predicted = {p.pid: float(p.true_burst) for p in procs}  # D ignores predictions
-                log = run_round_robin_family(procs, FixedQuantumPolicy(q), predicted)
-                waits.append(compute_metrics(procs, log).avg_waiting)
-        score = float(np.mean(waits))
-        if score < best_score:
-            best_score, best_q = score, q
-    return best_q
+                m = compute_metrics(procs, runner_c(procs))
+                c_waits.append(m.avg_waiting)
+                c_max.append(m.max_waiting)
+        mean_wait = float(np.mean(c_waits))
+        mean_max = float(np.mean(c_max))
+
+        if mean_wait <= limit and mean_max < feasible_score:
+            feasible_score, feasible_best = mean_max, (w_max, gap)
+        if mean_wait < fallback_score:
+            fallback_score, fallback_best = mean_wait, (w_max, gap)
+
+        current_best_score = feasible_score if feasible_best is not None else fallback_score
+        history.append({"trial": t + 1, "score": mean_max, "mean_wait": mean_wait,
+                         "feasible": mean_wait <= limit,
+                         "best_so_far": float(current_best_score),
+                         "candidate": (w_max, gap)})
+
+    best = feasible_best if feasible_best is not None else fallback_best
+    return best, history
 
 
-def tune_rule_based(val_pool: dict, fp) -> RuleBasedQuantumPolicy:
-    best_policy, best_score = None, float("inf")
-    for qt in (4, 6, 8):
-        for mt in (10.0, 20.0, 30.0):
-            for wt in (20.0, 30.0, 50.0):
-                policy = RuleBasedQuantumPolicy(queue_thresh=qt, median_thresh=mt, wait_thresh=wt)
-                waits = []
-                for lst in val_pool.values():
-                    for procs, spec in lst:
-                        predicted = _predicted_dict(procs, fp)
-                        log = run_round_robin_family(procs, policy, predicted)
-                        waits.append(compute_metrics(procs, log).avg_waiting)
-                score = float(np.mean(waits))
-                if score < best_score:
-                    best_score, best_policy = score, policy
-    return best_policy
+# ---------------------------------------------------------------------------
+# Algorithm D: fixed quantum
+# ---------------------------------------------------------------------------
+
+def tune_fixed_quantum_search(val_pool: dict, n_trials: int = 20, seed: int = 0
+                               ) -> Tuple[float, List[dict]]:
+    """D's quantum is searched over a wider integer range than the four
+    candidates E/F choose among (D is just a single dial, not tied to an
+    RL action space), so more trials genuinely explore more settings."""
+    def sample(rng):
+        return int(rng.integers(1, 41))
+
+    def score(q):
+        def runner(procs):
+            predicted = {p.pid: float(p.true_burst) for p in procs}  # D ignores predictions
+            return run_round_robin_family(procs, FixedQuantumPolicy(q), predicted)
+        return _mean_metric(val_pool, runner, "avg_waiting")
+
+    best_q, _, history = _random_search(n_trials, seed, sample, score)
+    return float(best_q), history
+
+
+# ---------------------------------------------------------------------------
+# Algorithm E: rule-based quantum thresholds
+# ---------------------------------------------------------------------------
+
+def tune_rule_based_search(val_pool: dict, fp, n_trials: int = 120, seed: int = 0
+                            ) -> Tuple[RuleBasedQuantumPolicy, List[dict]]:
+    def sample(rng):
+        return RuleBasedQuantumPolicy(
+            queue_thresh=int(rng.integers(2, 12)),
+            median_thresh=float(rng.uniform(4.0, 45.0)),
+            wait_thresh=float(rng.uniform(8.0, 90.0)),
+            base_idx=int(rng.integers(0, 3)),
+        )
+
+    def score(policy):
+        def runner(procs):
+            predicted = _predicted_dict(procs, fp)
+            return run_round_robin_family(procs, policy, predicted)
+        return _mean_metric(val_pool, runner, "avg_waiting")
+
+    best_policy, _, history = _random_search(n_trials, seed, sample, score)
+    return best_policy, history
 
 
 def run_full_experiment(cfg: ExperimentConfig) -> dict:
@@ -183,10 +280,24 @@ def run_full_experiment(cfg: ExperimentConfig) -> dict:
 
     best_name, fp, pred_metrics = fit_burst_predictor(train_pool, val_pool)
 
-    alpha = tune_alpha(val_pool, fp)
-    w_max, gap = tune_protected_c(val_pool, fp, alpha)
-    fixed_q = tune_fixed_quantum(val_pool)
-    rule_policy = tune_rule_based(val_pool, fp)
+    if cfg.verbose:
+        print(f"[tuning] alpha: {cfg.alpha_trials} trials ...")
+    alpha, alpha_history = tune_alpha_search(val_pool, fp, cfg.alpha_trials, cfg.random_state)
+
+    if cfg.verbose:
+        print(f"[tuning] C (w_max, gap): {cfg.c_trials} trials ...")
+    (w_max, gap), c_history = tune_protected_c_search(val_pool, fp, alpha, cfg.c_trials,
+                                                        cfg.random_state + 1)
+
+    if cfg.verbose:
+        print(f"[tuning] D (fixed quantum): {cfg.quantum_trials} trials ...")
+    fixed_q, quantum_history = tune_fixed_quantum_search(val_pool, cfg.quantum_trials,
+                                                           cfg.random_state + 2)
+
+    if cfg.verbose:
+        print(f"[tuning] E (rule thresholds): {cfg.rule_trials} trials ...")
+    rule_policy, rule_history = tune_rule_based_search(val_pool, fp, cfg.rule_trials,
+                                                         cfg.random_state + 3)
 
     def predicted_lookup(spec: WorkloadSpec, seed: int):
         procs = generate_workload(spec, seed)
@@ -195,10 +306,21 @@ def run_full_experiment(cfg: ExperimentConfig) -> dict:
 
     train_specs = [spec for lst in train_pool.values() for (_, spec) in lst]
     train_specs = list({s.name: s for s in train_specs}.values())
-    agent = train_qlearning_agent(train_specs, predicted_lookup,
-                                   n_episodes=cfg.qlearning_episodes,
-                                   seed=cfg.qlearning_seed,
-                                   context_switch_cost=cfg.context_switch_cost)
+    val_specs = [spec for lst in val_pool.values() for (_, spec) in lst]
+    val_specs = list({s.name: s for s in val_specs}.values())
+
+    if cfg.verbose:
+        print(f"[tuning] F (Q-learning): {cfg.qlearning_episodes} episodes ...")
+    agent, qlearning_history = train_qlearning_agent(
+        train_specs, predicted_lookup,
+        n_episodes=cfg.qlearning_episodes,
+        seed=cfg.qlearning_seed,
+        context_switch_cost=cfg.context_switch_cost,
+        eval_every=cfg.qlearning_eval_every,
+        eval_specs=val_specs if val_specs else None,
+        eval_seeds=[555001],
+        progress_every=cfg.qlearning_progress_every,
+    )
     frozen_policy = FrozenQPolicy(agent.q_table)
 
     algorithms = {
@@ -248,4 +370,11 @@ def run_full_experiment(cfg: ExperimentConfig) -> dict:
         "rule_policy": rule_policy,
         "rows": rows,
         "summary": summary,
+        "search_histories": {
+            "alpha": alpha_history,
+            "protected_c": c_history,
+            "fixed_quantum": quantum_history,
+            "rule_based": rule_history,
+            "qlearning": qlearning_history,
+        },
     }

@@ -207,6 +207,36 @@ class QuantumPolicy(Protocol):
                         own_wait: float) -> int: ...
 
 
+# Reference constants and default ("balanced") weights for the Q-learning
+# reward (Section 8.2 / Eq. 7): scale each term to roughly order one for a
+# typical event, as modelling choices rather than derived quantities.
+REWARD_REF = dict(w_ref=160.0, r_ref=50.0, s_ref=10.0, s_max=50.0, w_fair=100.0)
+DEFAULT_REWARD_WEIGHTS = dict(w1=1.0, w2=0.5, w3=0.5, w4=0.2, w5=0.2)
+
+
+def compute_reward(delta_wait: float, response_first: Optional[float],
+                    slowdown_at_completion: Optional[float], is_switch: bool,
+                    max_wait_tail: float, weights: Optional[dict] = None) -> float:
+    """Five-term reward (Eq. 7): waiting-time increase, first-response
+    latency, completion slowdown, a context-switch penalty, and a tail-wait
+    penalty once the longest queued wait exceeds w_fair. `response_first`
+    and `slowdown_at_completion` are None on steps where that event (first
+    dispatch / completion) doesn't occur this step, contributing zero."""
+    w = weights or DEFAULT_REWARD_WEIGHTS
+    ref = REWARD_REF
+    term1 = w["w1"] * delta_wait / ref["w_ref"]
+    term2 = w["w2"] * (response_first / ref["r_ref"]) if response_first is not None else 0.0
+    if slowdown_at_completion is not None:
+        excess = min(max(slowdown_at_completion - 1.0, 0.0), ref["s_max"])
+        term3 = w["w3"] * excess / ref["s_ref"]
+    else:
+        term3 = 0.0
+    term4 = w["w4"] * (1.0 if is_switch else 0.0)
+    tail = float(np.clip((max_wait_tail - ref["w_fair"]) / ref["w_fair"], 0.0, 1.0))
+    term5 = w["w5"] * tail
+    return -(term1 + term2 + term3 + term4 + term5)
+
+
 @dataclass
 class FixedQuantumPolicy:
     q: float = 4.0
@@ -236,7 +266,8 @@ class RuleBasedQuantumPolicy:
 
 def run_round_robin_family(procs: List[Process], policy: QuantumPolicy,
                             predicted: Dict[int, float], context_switch_cost: float = 1.0,
-                            step_callback: Optional[Callable] = None) -> EventLog:
+                            step_callback: Optional[Callable] = None,
+                            reward_weights: Optional[dict] = None) -> EventLog:
     """
     step_callback(state_dict, quantum_idx, reward, next_state_dict, done) is
     invoked after every dispatch step, so that Algorithm F's Q-learning agent
@@ -308,7 +339,8 @@ def run_round_robin_family(procs: List[Process], policy: QuantumPolicy,
             time += context_switch_cost
             log.context_switches += 1
 
-        if pid not in log.start_time:
+        is_first_dispatch = pid not in log.start_time
+        if is_first_dispatch:
             log.start_time[pid] = time
 
         run_time = min(q, remaining[pid])
@@ -323,14 +355,19 @@ def run_round_robin_family(procs: List[Process], policy: QuantumPolicy,
         remaining[pid] -= run_time
         executed[pid] += run_time
 
-        if remaining[pid] > 1e-9:
+        completed_this_step = remaining[pid] <= 1e-9
+        if not completed_this_step:
             queue.append(pid)
             ready_since[pid] = time
         else:
             log.completion_time[pid] = time
 
         wait_after = current_total_wait()
-        reward_wait_term = -(wait_after - wait_before)
+        delta_wait = wait_after - wait_before
+        response_first = (start - proc.arrival) if is_first_dispatch else None
+        slowdown_completion = ((time - proc.arrival) / max(proc.true_burst, 1)) if completed_this_step else None
+        reward = compute_reward(delta_wait, response_first, slowdown_completion, is_switch,
+                                 state["max_wait"], reward_weights)
         done = len(log.completion_time) == n
 
         log.events.append(DispatchEvent(pid, start, end, is_switch))
@@ -350,6 +387,6 @@ def run_round_robin_family(procs: List[Process], policy: QuantumPolicy,
                 next_state = dict(queue_len=nq_len, mean_pred_remaining=n_mean_pred,
                                    max_wait=max(n_own_wait, n_max_wait_others),
                                    imbalance=n_imbalance, own_wait=n_own_wait)
-            step_callback(state, q_idx, reward_wait_term, next_state, done)
+            step_callback(state, q_idx, reward, next_state, done)
 
     return log

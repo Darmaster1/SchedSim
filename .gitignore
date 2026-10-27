@@ -2,26 +2,16 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-.hypothesis/
 .ipynb_checkpoints/
 *.egg-info/
 .venv/
 venv/
-ENV/
 *.pkl
-*.npz
-
-# Generated data pools & checkpoints
-data/
-checkpoints/
-
-# Simulation results
 results/*.csv
 results/*.json
 results/run_log.txt
 !results/.gitkeep
-
-# LaTeX build artifacts
+.DS_Store
 paper/*.aux
 paper/*.log
 paper/*.out
@@ -31,7 +21,3 @@ paper/*.blg
 paper/*.fls
 paper/*.fdb_latexmk
 paper/*.synctex.gz
-
-# OS artifacts
-.DS_Store
-Thumbs.db

@@ -60,23 +60,37 @@ Each run writes to `results/`:
   comparisons used in the paper (B vs A, C vs B, C vs A, E vs D, F vs D, F vs E)
 - `cwabp_results.csv` -- CWABP vs. exponential averaging across 7 workload types
 
+## Continuous training (data flywheel)
+
+A separate CLI keeps the burst predictors and the Q-learning agent improving
+across repeated rounds instead of being fit once on a fixed batch:
+
+```bash
+python train.py run --rounds 5 --workloads 50          # grow the pool, refit, resume Q-learning
+python train.py run --rounds 20 --workloads 100 --episodes-per-round 2000
+python train.py status                                  # pool size, leaderboard, Q-table checkpoint
+```
+
+Each round: samples new workloads into an append-only pool
+(`training_pool.csv`, seeds strictly disjoint from the evaluation splits),
+refits all five regression models on the accumulated pool and logs a
+validation-RMSE leaderboard (`checkpoints/leaderboard.csv`), atomically
+promotes the best model to `checkpoints/predictor_latest.pkl`, and resumes
+Q-learning from `checkpoints/qtable_latest.npz`, continuing its
+$\varepsilon$-decay schedule from the cumulative episode count rather than
+restarting.
+
 ## Running the tests
 
 ```bash
-pip install pytest hypothesis
-# Run the 40 original unit & invariant tests
-pytest tests/test_*.py --ignore=tests/test_properties.py -v
-
-# Run the full test suite including randomized property-based tests (Hypothesis)
+pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-40 unit tests + 18 randomized property tests cover:
-- **Property-based randomized invariants (Hypothesis)** -- thousands of randomized
-  workloads test structural invariants: turnaround = waiting + burst decomposition across
-  Priority and RR engines, B(α=1) ≡ A identity, C with safeguards disabled ≡ B,
-  no priority inversion outside override when gap=0, Jain's index ∈ [1/n, 1],
-  starvation count ∈ [0, n], Q-state discretisation ∈ [0, 144), and deterministic frozen policy.
+52 tests: 42 unit/invariant tests plus `test_properties.py`, 10
+Hypothesis property-based suites that re-check the same invariants over
+randomly generated and automatically shrunk inputs instead of hand-picked
+cases. Together they cover:
 - **Determinism & leakage control** -- identical (spec, seed) always produces
   identical workloads; burst predictors never see true burst length,
   priority, or arrival time as inputs.
@@ -96,55 +110,25 @@ pytest tests/ -v
 - **Metrics** -- turnaround = waiting + burst length; Jain's index stays
   within `[1/n, 1]`; starvation-violation counts stay within `[0, n]`.
 
-## Continuous Training & Data Flywheel (`train.py`)
-
-To continuously generate randomized workloads, accumulate training data, and progressively improve models:
-
-```bash
-# Run 1 continuous round (generate random workloads -> pool -> retrain -> eval)
-python train.py run
-
-# Run multiple rounds with custom batch sizes
-python train.py run --rounds 5 --workloads 100 --q-episodes 1000
-
-# View current pool size & trained checkpoints
-python train.py status
-
-# Inspect model leaderboard (checkpoints ranked by validation RMSE)
-python train.py leaderboard
-
-# Evaluate current checkpoint against the frozen benchmark test set
-python train.py evaluate
-
-# Reset data pool and checkpoints to try fresh training sessions:
-python train.py reset -f              # Reset everything without prompt
-python train.py reset --pool-only     # Reset training data pool only
-python train.py reset --models-only   # Reset model checkpoints & leaderboard only
-```
-
 ## Repository layout
 
 ```
 schedsim/
-  workload.py        Synthetic workload generation (Section 6.2 of the paper)
-  random_spec.py     Combinatorial WorkloadSpec sampler for continuous random workloads
-  predictors.py      Five-model burst-length prediction + leakage control (7.1)
-  schedulers.py      Discrete-event engines + Algorithms A-E (7.2-7.6)
-  qlearning.py       Tabular Q-learning for Algorithm F (Section 8)
-  cwabp.py           CWABP predictor + event-driven SRTF simulator (Section 9)
-  metrics.py         Per-workload evaluation metrics (Section 11)
-  experiment.py      Pipeline orchestration: tuning, training, evaluation
-  stats.py           Paired Wilcoxon tests + bootstrap CIs (Section 10.2)
-  pool.py            Persistent data pool for continuous predictor retraining
-  checkpoint.py      Checkpointing for predictors and Q-tables + leaderboard
-  continuous.py      Continuous training loop orchestration
-tests/               Unit tests + randomized property tests (Hypothesis)
-run_experiment.py    CLI entry point for reproducing paper pilot numbers
-train.py             CLI entry point for continuous random training & data flywheel
-paper/               IEEE-format paper source (LaTeX) and compiled PDF
-results/             Output of the most recent run (gitignored except structure)
-data/                Persistent training pool storage
-checkpoints/         Model checkpoints and versioned training log
+  workload.py      Synthetic workload generation
+  predictors.py     Five-model burst-length prediction + leakage control
+  schedulers.py     Discrete-event engines + Algorithms A-E + reward function
+  qlearning.py       Tabular Q-learning for Algorithm F (resumable)
+  cwabp.py            CWABP predictor + event-driven SRTF simulator
+  pool.py              Append-only training pool for the continuous flywheel
+  checkpoint.py         Model refitting, leaderboard, atomic checkpointing
+  metrics.py             Per-workload evaluation metrics
+  experiment.py            Pipeline orchestration: random-search tuning, training, evaluation
+  stats.py                  Paired Wilcoxon tests + bootstrap CIs
+tests/                      52 tests: unit/invariant tests + test_properties.py (Hypothesis)
+run_experiment.py           CLI: one-shot pilot/full/deep experiment runs
+train.py                    CLI: continuous training flywheel (pool + checkpoint + resumable RL)
+paper/                      IEEE-format paper source (LaTeX) and compiled PDF
+results/                    Output of the most recent run (gitignored except structure)
 ```
 
 ## A note on scale

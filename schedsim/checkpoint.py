@@ -1,173 +1,82 @@
 """
-Checkpoint management for trained predictors and Q-learning agents.
-
-Every save writes both a versioned (timestamped) file and overwrites the
-canonical ``*_latest.*`` path so callers always have a stable reference
-to the most recent model, while the full version history is preserved for
-the leaderboard and for rollback.
-
-On-disk layout (checkpoints/ inside the repo root)::
-
-    checkpoints/
-        predictor_latest.pkl      -- most recently saved predictor
-        predictor_<ts>.pkl        -- versioned copies (never overwritten)
-        qtable_latest.npz         -- most recently saved Q-table
-        qtable_<ts>.npz           -- versioned copies
-        training_log.jsonl        -- one JSON line per save/evaluation event
-
-Dependency: joblib (already a transitive sklearn dependency; listed explicitly
-in requirements.txt so the import is stable across environments).
+Model checkpointing and a validation-RMSE leaderboard for the continuous
+training flywheel (`train.py`): refit every candidate burst-prediction model
+on the accumulated pool, record each round's validation RMSE to a leaderboard
+CSV, and atomically save the best model as the "latest" checkpoint that
+`run_experiment.py` or a resumed training round can load.
 """
 from __future__ import annotations
 
-import json
+import csv
 import os
-import shutil
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+import pickle
+import time
+from typing import Dict, List, Tuple
 
-import joblib
-import numpy as np
+from .predictors import FittedPredictor, evaluate_predictor, fit_predictor, MODEL_FACTORIES
+from .workload import Process
 
-_LOG_FILE = "training_log.jsonl"
-
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+LEADERBOARD_FIELDS = ["round", "timestamp", "model", "pool_size", "val_rmse", "val_mae", "val_r2",
+                       "is_best_this_round"]
 
 
-# ---------------------------------------------------------------------------
-# Predictor checkpoints  (joblib-serialised FittedPredictor)
-# ---------------------------------------------------------------------------
+def refit_all_models(pool_procs: List[Process], val_procs: List[Process],
+                      checkpoint_dir: str = "checkpoints", round_idx: int = 0
+                      ) -> Tuple[str, FittedPredictor, Dict[str, Dict[str, float]]]:
+    """Refit every candidate model on `pool_procs`, score each on
+    `val_procs`, write a timestamped checkpoint for each model plus a
+    leaderboard row, and atomically promote the best model to
+    `<checkpoint_dir>/predictor_latest.pkl`. Returns (best_name, best_fp, all_metrics)."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    leaderboard_path = os.path.join(checkpoint_dir, "leaderboard.csv")
+    leaderboard_exists = os.path.isfile(leaderboard_path)
 
-def save_predictor(
-    predictor,
-    metadata: Dict[str, Any],
-    ckpt_dir: str,
-) -> str:
-    """Save a FittedPredictor and accompanying metadata.
+    all_metrics: Dict[str, Dict[str, float]] = {}
+    fitted: Dict[str, FittedPredictor] = {}
+    for name in MODEL_FACTORIES:
+        fp = fit_predictor(name, pool_procs, use_endcode=True)
+        metrics = evaluate_predictor(fp, val_procs)
+        fitted[name] = fp
+        all_metrics[name] = metrics
 
-    Creates ``<ckpt_dir>/predictor_<timestamp>.pkl`` (versioned, never
-    overwritten) and updates ``predictor_latest.pkl`` atomically.
+        ckpt_path = os.path.join(checkpoint_dir, f"{name}_round{round_idx}.pkl")
+        with open(ckpt_path, "wb") as f:
+            pickle.dump(fp, f)
 
-    Returns
-    -------
-    Path to the versioned checkpoint file.
-    """
-    os.makedirs(ckpt_dir, exist_ok=True)
-    ts = _ts()
-    versioned = os.path.join(ckpt_dir, f"predictor_{ts}.pkl")
-    latest    = os.path.join(ckpt_dir, "predictor_latest.pkl")
-    payload   = {"predictor": predictor, "metadata": metadata, "saved_at": ts}
-    joblib.dump(payload, versioned)
-    shutil.copy2(versioned, latest)
-    _append_log(ckpt_dir, "predictor_saved", {**metadata, "path": versioned})
-    return versioned
+    best_name = min(all_metrics, key=lambda n: all_metrics[n]["rmse"])
+    best_fp = fitted[best_name]
 
+    with open(leaderboard_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=LEADERBOARD_FIELDS)
+        if not leaderboard_exists:
+            writer.writeheader()
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        for name, m in all_metrics.items():
+            writer.writerow({"round": round_idx, "timestamp": ts, "model": name,
+                              "pool_size": len(pool_procs), "val_rmse": m["rmse"],
+                              "val_mae": m["mae"], "val_r2": m["r2"],
+                              "is_best_this_round": name == best_name})
 
-def load_predictor(
-    ckpt_dir: str,
-    path: Optional[str] = None,
-) -> Tuple[Any, Dict]:
-    """Load the latest (or a specific) predictor checkpoint.
+    # Atomic promotion: write to a temp file then rename, so a reader never
+    # sees a partially-written "latest" checkpoint.
+    latest_path = os.path.join(checkpoint_dir, "predictor_latest.pkl")
+    tmp_path = latest_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(best_fp, f)
+    os.replace(tmp_path, latest_path)
 
-    Returns ``(predictor, metadata)`` or ``(None, {})`` if nothing exists.
-    """
-    p = path or os.path.join(ckpt_dir, "predictor_latest.pkl")
-    if not os.path.exists(p):
-        return None, {}
-    payload = joblib.load(p)
-    return payload["predictor"], payload.get("metadata", {})
-
-
-# ---------------------------------------------------------------------------
-# Q-table checkpoints  (NumPy NPZ)
-# ---------------------------------------------------------------------------
-
-def save_qtable(
-    q_table: np.ndarray,
-    metadata: Dict[str, Any],
-    ckpt_dir: str,
-) -> str:
-    """Save a Q-table and accompanying metadata.
-
-    Scalar metadata values are stored as 0-d NumPy arrays inside the NPZ so
-    the file is self-contained (no separate JSON sidecar needed).
-
-    Returns
-    -------
-    Path to the versioned checkpoint file.
-    """
-    os.makedirs(ckpt_dir, exist_ok=True)
-    ts = _ts()
-    versioned = os.path.join(ckpt_dir, f"qtable_{ts}.npz")
-    latest    = os.path.join(ckpt_dir, "qtable_latest.npz")
-    safe_meta = {
-        k: np.array(v)
-        for k, v in metadata.items()
-        if isinstance(v, (int, float, str, bool))
-    }
-    np.savez(versioned, q_table=q_table, **safe_meta)
-    shutil.copy2(versioned, latest)
-    _append_log(ckpt_dir, "qtable_saved", {**metadata, "path": versioned})
-    return versioned
+    return best_name, best_fp, all_metrics
 
 
-def load_qtable(
-    ckpt_dir: str,
-    path: Optional[str] = None,
-) -> Tuple[Optional[np.ndarray], Dict]:
-    """Load the latest (or a specific) Q-table checkpoint.
-
-    Returns ``(q_table, metadata)`` or ``(None, {})`` if nothing exists.
-    """
-    p = path or os.path.join(ckpt_dir, "qtable_latest.npz")
-    if not os.path.exists(p):
-        return None, {}
-    d = np.load(p, allow_pickle=False)
-    q_table = d["q_table"]
-    meta = {k: d[k].item() for k in d.files if k != "q_table"}
-    return q_table, meta
+def load_latest_predictor(checkpoint_dir: str = "checkpoints") -> FittedPredictor:
+    path = os.path.join(checkpoint_dir, "predictor_latest.pkl")
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Training log  (append-only JSONL)
-# ---------------------------------------------------------------------------
-
-def _append_log(ckpt_dir: str, event: str, data: Dict):
-    """Append one structured event to the training log."""
-    path  = os.path.join(ckpt_dir, _LOG_FILE)
-    entry = {"event": event, "ts": _ts(), **data}
-    # Serialise only JSON-safe scalars; skip objects.
-    safe  = {k: v for k, v in entry.items()
-              if isinstance(v, (str, int, float, bool, type(None)))}
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(safe) + "\n")
-
-
-def read_training_log(ckpt_dir: str) -> list:
-    """Return all training-log entries as a list of dicts (oldest first)."""
-    path = os.path.join(ckpt_dir, _LOG_FILE)
-    if not os.path.exists(path):
+def read_leaderboard(checkpoint_dir: str = "checkpoints") -> List[dict]:
+    path = os.path.join(checkpoint_dir, "leaderboard.csv")
+    if not os.path.isfile(path):
         return []
-    entries = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-    return entries
-
-
-def leaderboard(ckpt_dir: str, metric: str = "val_rmse") -> list:
-    """Return predictor-save events sorted by `metric` (ascending = better).
-
-    Use ``metric='val_rmse'`` to rank by validation RMSE.
-    """
-    log   = read_training_log(ckpt_dir)
-    saves = [e for e in log
-              if e.get("event") == "predictor_saved" and metric in e]
-    return sorted(saves, key=lambda e: e[metric])
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))

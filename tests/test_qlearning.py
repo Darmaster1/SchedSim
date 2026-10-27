@@ -46,9 +46,51 @@ def test_training_runs_and_produces_nontrivial_q_table():
         predicted = {p.pid: float(p.true_burst) for p in procs}
         return procs, predicted
 
-    agent = train_qlearning_agent([spec], lookup, n_episodes=40, seed=0)
+    agent, history = train_qlearning_agent([spec], lookup, n_episodes=40, seed=0)
     assert agent.q_table.shape == (N_STATES, 4)
     assert np.any(agent.q_table != 0.0)
+    assert history == []  # eval_every defaults to 0 -> no learning-curve logging
+
+
+def test_training_with_eval_every_logs_learning_curve():
+    spec = WorkloadSpec("qtrain_eval", n_processes=12)
+
+    def lookup(spec, seed):
+        procs = generate_workload(spec, seed)
+        predicted = {p.pid: float(p.true_burst) for p in procs}
+        return procs, predicted
+
+    agent, history = train_qlearning_agent([spec], lookup, n_episodes=50, seed=0,
+                                            eval_every=10, eval_specs=[spec], eval_seeds=[1])
+    assert len(history) == 5  # 50 episodes / eval_every 10
+    for entry in history:
+        assert set(entry.keys()) == {"episode", "mean_avg_waiting", "epsilon"}
+        assert entry["mean_avg_waiting"] >= 0
+
+
+def test_more_training_episodes_tend_to_improve_learning_curve():
+    """A weak but meaningful sanity check that training is actually doing
+    something: the mean of the second half of the learning curve should be
+    no worse (allowing noise) than the very first logged evaluation, on a
+    workload simple enough to learn quickly."""
+    spec = WorkloadSpec("qtrain_improve", n_processes=10, burst_mode="mixed")
+
+    def lookup(spec, seed):
+        procs = generate_workload(spec, seed)
+        predicted = {p.pid: float(p.true_burst) for p in procs}
+        return procs, predicted
+
+    agent, history = train_qlearning_agent([spec], lookup, n_episodes=300, seed=1,
+                                            eval_every=20, eval_specs=[spec],
+                                            eval_seeds=[11, 22, 33])
+    assert len(history) == 15
+    first_score = history[0]["mean_avg_waiting"]
+    second_half_mean = np.mean([h["mean_avg_waiting"] for h in history[len(history) // 2:]])
+    # Allow generous slack: this is a smoke-level sanity check, not a tight
+    # convergence guarantee (144-state tabular Q-learning on a 10-process
+    # workload is noisy), but training should not be making things wildly
+    # worse by the second half of the run.
+    assert second_half_mean <= first_score * 1.5
 
 
 def test_frozen_eval_has_no_exploration_randomness():
@@ -59,7 +101,7 @@ def test_frozen_eval_has_no_exploration_randomness():
         predicted = {p.pid: float(p.true_burst) for p in procs}
         return procs, predicted
 
-    agent = train_qlearning_agent([spec], lookup, n_episodes=30, seed=0)
+    agent, _ = train_qlearning_agent([spec], lookup, n_episodes=30, seed=0)
     frozen = FrozenQPolicy(agent.q_table)
 
     procs, predicted = lookup(spec, 999)

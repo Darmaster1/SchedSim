@@ -6,12 +6,19 @@ Quick smoke run (few seconds):
     python run_experiment.py --quick
 
 Default pilot-scale run (used for the numbers in the accompanying paper,
-~10-15 seconds):
+~10-30 seconds):
     python run_experiment.py
 
 Larger run (closer to the full protocol described in the paper; several
 minutes depending on machine):
     python run_experiment.py --full
+
+DEEP training run: 20,000-30,000 Q-learning episodes plus large random-search
+budgets for Algorithms B, C, D, and E, with a logged learning/search curve
+for every one of them (several minutes; use --episodes to pick an exact
+number instead of the 20,000 default):
+    python run_experiment.py --deep
+    python run_experiment.py --deep --episodes 30000
 
 CWABP (Section 9 extension) comparison only:
     python run_experiment.py --cwabp-only
@@ -41,17 +48,30 @@ CWABP_CONFIGS = [
 ]
 
 
+def _write_csv(path: str, rows):
+    if not rows:
+        return
+    keys = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k) for k in keys})
+
+
 def run_main_study(cfg: ExperimentConfig, outdir: str):
     print(f"[main study] n_processes={cfg.n_processes}, "
           f"train/val/test per category={cfg.workloads_per_category_train}/"
-          f"{cfg.workloads_per_category_val}/{cfg.workloads_per_category_test}, "
-          f"q-learning episodes={cfg.qlearning_episodes}")
+          f"{cfg.workloads_per_category_val}/{cfg.workloads_per_category_test}")
+    print(f"[main study] search/training budgets: alpha={cfg.alpha_trials} trials, "
+          f"C={cfg.c_trials} trials, D={cfg.quantum_trials} trials, "
+          f"E={cfg.rule_trials} trials, F(Q-learning)={cfg.qlearning_episodes} episodes")
     t0 = time.time()
     result = run_full_experiment(cfg)
     elapsed = time.time() - t0
     print(f"[main study] done in {elapsed:.1f}s")
     print(f"[main study] best burst predictor: {result['best_predictor']}")
-    print(f"[main study] tuned: alpha={result['alpha']}, w_max={result['w_max']}, "
+    print(f"[main study] tuned: alpha={result['alpha']:.3f}, w_max={result['w_max']:.1f}, "
           f"gap={result['gap']}, fixed_quantum={result['fixed_quantum']}")
 
     os.makedirs(outdir, exist_ok=True)
@@ -63,6 +83,23 @@ def run_main_study(cfg: ExperimentConfig, outdir: str):
 
     with open(os.path.join(outdir, "summary.json"), "w") as f:
         json.dump(result["summary"], f, indent=2)
+
+    # --- learning / search curves: one CSV per tunable algorithm -----------
+    hist = result["search_histories"]
+    for name in ("alpha", "protected_c", "fixed_quantum", "rule_based"):
+        rows = [{"trial": h["trial"], "score": h["score"], "best_so_far": h["best_so_far"],
+                 "candidate": str(h["candidate"])} for h in hist[name]]
+        _write_csv(os.path.join(outdir, f"search_curve_{name}.csv"), rows)
+    if hist["qlearning"]:
+        _write_csv(os.path.join(outdir, "qlearning_learning_curve.csv"), hist["qlearning"])
+        first = hist["qlearning"][0]["mean_avg_waiting"]
+        last = hist["qlearning"][-1]["mean_avg_waiting"]
+        print(f"[main study] Q-learning curve: episode {hist['qlearning'][0]['episode']} "
+              f"avg_waiting={first:.2f}  ->  episode {hist['qlearning'][-1]['episode']} "
+              f"avg_waiting={last:.2f}  ({'better' if last < first else 'worse/noisy'})")
+    else:
+        print("[main study] no Q-learning learning curve logged "
+              "(pass --eval-every N, e.g. via --deep, to enable it)")
 
     print("\n[main study] per-algorithm summary (mean over test workloads):")
     header = ["alg"] + list(next(iter(result["summary"].values())).keys())
@@ -113,10 +150,7 @@ def run_cwabp_study(n_seeds: int, outdir: str):
         print(f"  {name:24s} EA={row['ea_avg_waiting']:7.2f}  CWABP={row['cwabp_avg_waiting']:7.2f} "
               f"({row['pct_change_waiting']:+5.1f}%)  RMSE {row['ea_rmse']:.2f} -> {row['cwabp_rmse']:.2f}")
 
-    with open(os.path.join(outdir, "cwabp_results.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    _write_csv(os.path.join(outdir, "cwabp_results.csv"), rows)
     return rows
 
 
@@ -124,9 +158,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--quick", action="store_true", help="tiny smoke-test scale (~2s)")
     p.add_argument("--full", action="store_true", help="larger scale, closer to the full protocol (slow)")
+    p.add_argument("--deep", action="store_true",
+                    help="20,000+ Q-learning episodes and large random-search budgets for B/C/D/E, "
+                         "with learning/search curves logged to results/ (several minutes)")
+    p.add_argument("--episodes", type=int, default=None,
+                    help="override Q-learning episode count directly (e.g. --episodes 30000)")
     p.add_argument("--cwabp-only", action="store_true", help="only run the CWABP (Section 9) comparison")
     p.add_argument("--outdir", default="results", help="output directory for CSV/JSON (default: results)")
-    p.add_argument("--seed", type=int, default=0, help="Q-learning training seed")
+    p.add_argument("--seed", type=int, default=0, help="base random seed for tuning and Q-learning training")
+    p.add_argument("--quiet", action="store_true", help="suppress per-tuning-stage progress lines")
     args = p.parse_args()
 
     if args.cwabp_only:
@@ -136,15 +176,31 @@ def main():
     if args.quick:
         cfg = ExperimentConfig(n_processes=12, workloads_per_category_train=1,
                                 workloads_per_category_val=1, workloads_per_category_test=1,
-                                qlearning_episodes=40, qlearning_seed=args.seed)
+                                qlearning_episodes=40, qlearning_seed=args.seed,
+                                alpha_trials=5, c_trials=5, quantum_trials=5, rule_trials=5,
+                                random_state=args.seed, verbose=not args.quiet)
+    elif args.deep:
+        cfg = ExperimentConfig(n_processes=25, workloads_per_category_train=4,
+                                workloads_per_category_val=4, workloads_per_category_test=6,
+                                qlearning_episodes=args.episodes or 20000,
+                                qlearning_seed=args.seed,
+                                qlearning_eval_every=max(1, (args.episodes or 20000) // 100),
+                                qlearning_progress_every=max(1, (args.episodes or 20000) // 20),
+                                alpha_trials=200, c_trials=300, quantum_trials=100, rule_trials=600,
+                                random_state=args.seed, verbose=not args.quiet)
     elif args.full:
         cfg = ExperimentConfig(n_processes=30, workloads_per_category_train=10,
                                 workloads_per_category_val=6, workloads_per_category_test=10,
-                                qlearning_episodes=2000, qlearning_seed=args.seed)
+                                qlearning_episodes=args.episodes or 4000, qlearning_seed=args.seed,
+                                qlearning_eval_every=max(1, (args.episodes or 4000) // 50),
+                                alpha_trials=50, c_trials=100, quantum_trials=30, rule_trials=250,
+                                random_state=args.seed, verbose=not args.quiet)
     else:
         cfg = ExperimentConfig(n_processes=25, workloads_per_category_train=3,
                                 workloads_per_category_val=3, workloads_per_category_test=5,
-                                qlearning_episodes=600, qlearning_seed=args.seed)
+                                qlearning_episodes=args.episodes or 600, qlearning_seed=args.seed,
+                                alpha_trials=25, c_trials=60, quantum_trials=20, rule_trials=120,
+                                random_state=args.seed, verbose=not args.quiet)
 
     run_main_study(cfg, args.outdir)
     print()

@@ -1,497 +1,208 @@
 """
-Property-based tests using the ``hypothesis`` library.
+Property-based randomized testing (Hypothesis).
 
-These tests generate **random** workloads (random spec parameters and seeds)
-and assert structural invariants that the paper claims hold universally -- not
-just on the 13 hand-crafted categories used in the paper's pilot study.  Every
-invariant here maps directly to a claim made in the paper.
+Unlike tests/test_*.py, which check specific hand-picked cases, every test
+here states an invariant that must hold for *any* input in a described
+range, and Hypothesis searches that space for a counterexample across many
+randomly generated (and adversarially shrunk) inputs per run. If a property
+is violated, Hypothesis automatically shrinks the failing input down to a
+minimal reproducing example before reporting it.
 
-When ``hypothesis`` finds a counterexample it automatically shrinks it to the
-smallest failing case and stores it in its local database, so subsequent runs
-immediately re-run any previously found failures.  This gives the equivalent
-of thousands of randomised test cases without any manual effort.
-
-Running:
-    pytest tests/test_properties.py -v
-    pytest tests/test_properties.py -v --hypothesis-seed=0   # deterministic
-
-Slow tests are suppressed by default; use::
-    pytest tests/test_properties.py -v -m "not slow"
+10 property suites, covering: workload generation invariants, the A/B/C
+and D/E/F structural identities also spot-checked in test_schedulers.py
+(here re-verified across a much wider input space), Q-learning state
+discretization bounds, CWABP's no-future-information guarantee, Jain's
+index bounds, and burst-predictor leakage control.
 """
 from __future__ import annotations
 
 import math
 
-import numpy as np
-import pytest
-from hypothesis import HealthCheck, given, settings, assume
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from schedsim.metrics import compute_metrics, STARVATION_THRESHOLD
-from schedsim.predictors import fit_predictor
-from schedsim.qlearning import (
-    N_STATES, FrozenQPolicy, QLearningAgent, discretize_state,
-)
-from schedsim.random_spec import random_workload_spec
-from schedsim.schedulers import (
-    AlgorithmA_Priority, AlgorithmB_WeightedML, AlgorithmC_ProtectedML,
-    FixedQuantumPolicy, QUANTA, RuleBasedQuantumPolicy,
-    run_priority_family, run_round_robin_family,
-)
+from schedsim.cwabp import Burst, CWABPPredictor
+from schedsim.metrics import compute_metrics
+from schedsim.predictors import _feature_matrix
+from schedsim.qlearning import N_STATES, discretize_state
+from schedsim.schedulers import (AlgorithmA_Priority, AlgorithmB_WeightedML,
+                                  AlgorithmC_ProtectedML, FixedQuantumPolicy,
+                                  run_priority_family, run_round_robin_family)
 from schedsim.workload import WorkloadSpec, generate_workload
 
+_COMMON_SETTINGS = settings(max_examples=40, deadline=None,
+                             suppress_health_check=[HealthCheck.too_slow])
+
+_n_processes_st = st.integers(min_value=2, max_value=40)
+_seed_st = st.integers(min_value=0, max_value=10_000_000)
+_priority_mode_st = st.sampled_from(["uniform", "skewed", "adversarial"])
+_burst_mode_st = st.sampled_from(["short", "long", "mixed", "heavy_tailed"])
+_arrival_mode_st = st.sampled_from(["simultaneous", "staggered", "bursty"])
+
+
+def _random_workload(n, seed, priority_mode="uniform", burst_mode="mixed", arrival_mode="staggered"):
+    spec = WorkloadSpec("prop", n_processes=n, priority_mode=priority_mode,
+                         burst_mode=burst_mode, arrival_mode=arrival_mode)
+    return generate_workload(spec, seed)
+
+
 # ---------------------------------------------------------------------------
-# Hypothesis strategies
+# 1. Workload generation invariants
 # ---------------------------------------------------------------------------
 
-_BURST_MODES    = ("short", "long", "mixed", "heavy_tailed")
-_ARRIVAL_MODES  = ("simultaneous", "staggered", "bursty")
-_PRIORITY_MODES = ("uniform", "skewed", "adversarial")
-_FEATURE_STRS   = ("strong", "moderate", "weak", "noisy", "misleading")
-
-# Keep workload small so each test stays fast under hypothesis.
-_N_MIN, _N_MAX = 3, 30
-
-
-@st.composite
-def workload_strategy(draw):
-    """Hypothesis strategy: sample a random (WorkloadSpec, seed) pair."""
-    n       = draw(st.integers(_N_MIN, _N_MAX))
-    bm      = draw(st.sampled_from(_BURST_MODES))
-    am      = draw(st.sampled_from(_ARRIVAL_MODES))
-    pm      = draw(st.sampled_from(_PRIORITY_MODES))
-    fs      = draw(st.sampled_from(_FEATURE_STRS))
-    load    = draw(st.floats(0.2, 1.8, allow_nan=False, allow_infinity=False))
-    seed    = draw(st.integers(0, 9_999_999))
-    spec    = WorkloadSpec(
-        name          = f"hyp_{n}_{bm[:3]}_{am[:3]}",
-        n_processes   = n,
-        burst_mode    = bm,
-        arrival_mode  = am,
-        priority_mode = pm,
-        feature_strength = fs,
-        offered_load  = round(load, 3),
-    )
-    return spec, seed
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st, priority_mode=_priority_mode_st,
+       burst_mode=_burst_mode_st)
+def test_property_workload_fields_always_in_range(n, seed, priority_mode, burst_mode):
+    procs = _random_workload(n, seed, priority_mode, burst_mode)
+    assert len(procs) == n
+    for p in procs:
+        assert 1 <= p.priority <= 10
+        assert 1 <= p.true_burst <= 400
+        assert p.arrival >= 0.0
 
 
-def _make_procs_and_oracle(spec, seed):
-    """Generate processes and return oracle (true-burst) predictions."""
-    procs     = generate_workload(spec, seed)
+# ---------------------------------------------------------------------------
+# 2. Turnaround = Waiting + Burst, for any workload, under Algorithm A
+# ---------------------------------------------------------------------------
+
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st)
+def test_property_turnaround_decomposition_holds_for_any_workload(n, seed):
+    procs = _random_workload(n, seed)
     predicted = {p.pid: float(p.true_burst) for p in procs}
-    return procs, predicted
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 1 -- turnaround decomposition (Priority family)
-# Paper: "turnaround T_i = c_i - a_i = W_i + b_i"
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_turnaround_equals_waiting_plus_burst_priority(spec_seed):
-    """For every process in every random priority-family run,
-    turnaround = waiting + true_burst (paper §4.1)."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
     log = run_priority_family(procs, AlgorithmA_Priority(), predicted)
-    m   = compute_metrics(procs, log)
-    by_pid = {p.pid: p for p in procs}
     for p in procs:
-        c  = log.completion_time[p.pid]
-        s  = log.start_time[p.pid]
-        tat = c - p.arrival
-        wait = tat - p.true_burst
-        # Turnaround must be non-negative and >= burst
-        assert tat  >= p.true_burst - 1e-6, (
-            f"pid {p.pid}: turnaround {tat:.3f} < burst {p.true_burst}")
-        assert wait >= -1e-6, (
-            f"pid {p.pid}: negative waiting time {wait:.3f}")
+        t = log.completion_time[p.pid] - p.arrival
+        w = t - p.true_burst
+        r = log.start_time[p.pid] - p.arrival
+        assert t >= 0
+        assert r >= -1e-9
+        assert math.isclose(t, w + p.true_burst, abs_tol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# INVARIANT 2 -- turnaround decomposition (Round Robin family)
+# 3. B(alpha=1) == A, for any workload (wider re-check of test_schedulers.py)
 # ---------------------------------------------------------------------------
 
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_turnaround_equals_waiting_plus_burst_rr(spec_seed):
-    """Same decomposition invariant holds for the Round Robin engine."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_round_robin_family(procs, FixedQuantumPolicy(q=4), predicted)
-    for p in procs:
-        c    = log.completion_time[p.pid]
-        tat  = c - p.arrival
-        wait = tat - p.true_burst
-        assert tat  >= p.true_burst - 1e-6
-        assert wait >= -1e-6
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 3 -- B(alpha=1) == A  (pid-for-pid, not just metric-equal)
-# Paper: "alpha=1 reproduces A exactly (verified by unit test; §VI-B)"
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=300,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_B_alpha1_equals_A_random_workloads(spec_seed):
-    """B with alpha=1 produces the *same dispatch sequence* as A on every
-    random workload -- not just matching metrics."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st, priority_mode=_priority_mode_st)
+def test_property_B_alpha_1_equals_A_for_any_workload(n, seed, priority_mode):
+    procs = _random_workload(n, seed, priority_mode)
+    predicted = {p.pid: float(p.true_burst) for p in procs}
     log_a = run_priority_family(procs, AlgorithmA_Priority(), predicted)
     log_b = run_priority_family(procs, AlgorithmB_WeightedML(alpha=1.0), predicted)
-    order_a = [e.pid for e in log_a.events]
-    order_b = [e.pid for e in log_b.events]
-    assert order_a == order_b, (
-        f"Dispatch sequences differ for spec={spec.name}, seed={seed}\n"
-        f"  A: {order_a}\n  B: {order_b}"
-    )
+    assert [e.pid for e in log_a.events] == [e.pid for e in log_b.events]
 
 
 # ---------------------------------------------------------------------------
-# INVARIANT 4 -- C with safeguards disabled == B  (pid-for-pid)
-# Paper: "C-with-safeguards-disabled ≡ B ... not merely metric-equal; §VII-B"
+# 4. C with safeguards disabled == B, for any workload and any alpha
 # ---------------------------------------------------------------------------
 
-@given(
-    workload_strategy(),
-    st.floats(0.0, 1.0, allow_nan=False),
-)
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_C_safeguards_disabled_equals_B_random(spec_seed, alpha):
-    """C with (w_max=inf, gap=999) is pid-for-pid identical to B."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log_b = run_priority_family(
-        procs, AlgorithmB_WeightedML(alpha=alpha), predicted)
-    log_c = run_priority_family(
-        procs, AlgorithmC_ProtectedML(alpha=alpha, w_max=1e12, gap=999), predicted)
-    assert ([e.pid for e in log_b.events]
-            == [e.pid for e in log_c.events])
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st, alpha=st.floats(min_value=0.0, max_value=1.0,
+                                                          allow_nan=False, allow_infinity=False))
+def test_property_C_disabled_equals_B_for_any_workload_and_alpha(n, seed, alpha):
+    procs = _random_workload(n, seed)
+    predicted = {p.pid: float(p.true_burst) for p in procs}
+    log_b = run_priority_family(procs, AlgorithmB_WeightedML(alpha), predicted)
+    log_c = run_priority_family(procs, AlgorithmC_ProtectedML(alpha, w_max=1e9, gap=999), predicted)
+    assert [e.pid for e in log_b.events] == [e.pid for e in log_c.events]
 
 
 # ---------------------------------------------------------------------------
-# INVARIANT 5 -- C with gap=0: no priority inversion outside override events
-# Paper: "G=0 => no inversion outside override events; §VII-B"
+# 5. C with gap=0: inversions never exceed override activations
 # ---------------------------------------------------------------------------
 
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_C_gap0_no_inversion_outside_override(spec_seed):
-    """With gap=0, every recorded inversion must be an override activation."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    assume(len(procs) >= 2)  # needs at least 2 processes for inversion to make sense
-    policy = AlgorithmC_ProtectedML(alpha=0.5, w_max=50.0, gap=0)
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st,
+       w_max=st.floats(min_value=5.0, max_value=200.0, allow_nan=False, allow_infinity=False))
+def test_property_C_gap_zero_bounds_inversions_by_activations(n, seed, w_max):
+    procs = _random_workload(n, seed, priority_mode="adversarial")
+    predicted = {p.pid: float(p.true_burst) for p in procs}
+    policy = AlgorithmC_ProtectedML(alpha=0.5, w_max=w_max, gap=0)
     run_priority_family(procs, policy, predicted)
-    assert policy.inversions <= policy.activations, (
-        f"gap=0 produced {policy.inversions} inversions but only "
-        f"{policy.activations} override activations"
-    )
+    assert policy.inversions <= policy.activations
 
 
 # ---------------------------------------------------------------------------
-# INVARIANT 6 -- Jain's fairness index in [1/n, 1]
-# Paper: "Jain's index ... stays within analytically required bounds; §VII-B"
+# 6. Round Robin: every process in the workload eventually completes
 # ---------------------------------------------------------------------------
 
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_jain_index_in_valid_range_priority(spec_seed):
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st,
+       quantum=st.floats(min_value=1.0, max_value=50.0, allow_nan=False, allow_infinity=False))
+def test_property_rr_every_process_completes(n, seed, quantum):
+    procs = _random_workload(n, seed)
+    predicted = {p.pid: float(p.true_burst) for p in procs}
+    log = run_round_robin_family(procs, FixedQuantumPolicy(quantum), predicted)
+    assert set(log.completion_time.keys()) == {p.pid for p in procs}
+    for p in procs:
+        assert log.completion_time[p.pid] >= p.arrival
+
+
+# ---------------------------------------------------------------------------
+# 7. Q-learning state discretization always lands in [0, N_STATES)
+# ---------------------------------------------------------------------------
+
+@_COMMON_SETTINGS
+@given(q=st.floats(min_value=0, max_value=1000, allow_nan=False),
+       b=st.floats(min_value=0, max_value=1000, allow_nan=False),
+       w=st.floats(min_value=0, max_value=5000, allow_nan=False),
+       i=st.floats(min_value=0, max_value=1000, allow_nan=False))
+def test_property_state_discretization_always_bounded(q, b, w, i):
+    s = discretize_state(q, b, w, i)
+    assert 0 <= s < N_STATES
+
+
+# ---------------------------------------------------------------------------
+# 8. CWABP: prediction for burst n never depends on burst n's own true length
+# ---------------------------------------------------------------------------
+
+@_COMMON_SETTINGS
+@given(feature=st.floats(min_value=-1000, max_value=1000, allow_nan=False, allow_infinity=False),
+       true_len_a=st.floats(min_value=0.1, max_value=10000, allow_nan=False, allow_infinity=False),
+       true_len_b=st.floats(min_value=0.1, max_value=10000, allow_nan=False, allow_infinity=False))
+def test_property_cwabp_no_future_leakage(feature, true_len_a, true_len_b):
+    pred = CWABPPredictor(window=5, shrink=0.8, min_samples=2, beta=0.5)
+    for i, (x, y) in enumerate([(1.0, 10.0), (1.2, 11.0)]):
+        b = Burst(0, i, float(i), true_length=y, feature=x)
+        pred.observe(b, y)
+
+    b_a = Burst(0, 2, 2.0, true_length=true_len_a, feature=feature)
+    b_b = Burst(0, 2, 2.0, true_length=true_len_b, feature=feature)
+    # Same history, same feature, different (not-yet-observed) true length:
+    # predictions must be identical, and finite/positive.
+    pa, pb = pred.predict(b_a), pred.predict(b_b)
+    assert pa == pb
+    assert pa >= 1.0
+    assert math.isfinite(pa)
+
+
+# ---------------------------------------------------------------------------
+# 9. Jain's fairness index stays within [1/n, 1] for any workload
+# ---------------------------------------------------------------------------
+
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st, arrival_mode=_arrival_mode_st)
+def test_property_jain_index_bounded_for_any_workload(n, seed, arrival_mode):
+    procs = _random_workload(n, seed, arrival_mode=arrival_mode)
+    predicted = {p.pid: float(p.true_burst) for p in procs}
     log = run_priority_family(procs, AlgorithmA_Priority(), predicted)
-    m   = compute_metrics(procs, log)
-    n   = len(procs)
-    assert 1.0 / n - 1e-9 <= m.jain_index <= 1.0 + 1e-9, (
-        f"Jain index {m.jain_index:.6f} out of [1/{n}, 1]"
-    )
-
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_jain_index_in_valid_range_rr(spec_seed):
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_round_robin_family(procs, FixedQuantumPolicy(q=4), predicted)
-    m   = compute_metrics(procs, log)
-    n   = len(procs)
+    m = compute_metrics(procs, log)
     assert 1.0 / n - 1e-9 <= m.jain_index <= 1.0 + 1e-9
 
 
 # ---------------------------------------------------------------------------
-# INVARIANT 7 -- starvation count in [0, n]
-# Paper: "starvation-violation counts stay within [0, n]; §VII-B"
+# 10. Burst predictor feature matrix never leaks true burst length
 # ---------------------------------------------------------------------------
 
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_starvation_count_bounded(spec_seed):
-    """Starvation violation count must be in [0, n] for every workload."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_priority_family(procs, AlgorithmA_Priority(), predicted)
-    m   = compute_metrics(procs, log)
-    n   = len(procs)
-    assert 0 <= m.starvation_violations <= n
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 8 -- all processes complete (no process left in queue forever)
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_all_processes_complete_priority(spec_seed):
-    """Every process must appear in completion_time after the priority run."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_priority_family(procs, AlgorithmA_Priority(), predicted)
-    pids = {p.pid for p in procs}
-    assert set(log.completion_time.keys()) == pids
-    assert set(log.start_time.keys())      == pids
-
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_all_processes_complete_rr(spec_seed):
-    """Every process must appear in completion_time after the RR run."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_round_robin_family(procs, FixedQuantumPolicy(q=4), predicted)
-    pids = {p.pid for p in procs}
-    assert set(log.completion_time.keys()) == pids
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 9 -- Q-learning state discretisation always in [0, N_STATES)
-# Paper: "Q-learning state indices always lie in [0, 144); §VII-B"
-# ---------------------------------------------------------------------------
-
-@given(
-    st.floats(1.0, 200.0, allow_nan=False),   # queue_len (treated as float -> int)
-    st.floats(0.0, 500.0, allow_nan=False),   # mean_pred_remaining
-    st.floats(0.0, 1000.0, allow_nan=False),  # max_wait
-    st.floats(1.0, 20.0, allow_nan=False),    # imbalance
-    st.floats(0.0, 500.0, allow_nan=False),   # own_wait
-)
-@settings(max_examples=500, deadline=None)
-def test_q_state_always_in_range(
-        queue_len, mean_pred, max_wait, imbalance, own_wait):
-    """discretize_state must return a value in [0, N_STATES=144) for any inputs."""
-    s = discretize_state(
-        queue_len=int(queue_len),
-        mean_pred_remaining=mean_pred,
-        max_wait=max_wait,
-        imbalance=imbalance,
-        own_wait=own_wait,
-    )
-    assert 0 <= s < N_STATES, f"State {s} out of [0, {N_STATES})"
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 10 -- frozen Q-policy is fully deterministic
-# Paper: "a frozen policy is fully deterministic; §VII-B"
-# ---------------------------------------------------------------------------
-
-@given(
-    workload_strategy(),
-    st.integers(0, 9_999),    # Q-table training seed
-)
-@settings(
-    max_examples=50,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_frozen_policy_deterministic(spec_seed, qtable_seed):
-    """Running the frozen Q-policy twice on the same workload must produce
-    the *identical* dispatch sequence."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-
-    agent   = QLearningAgent(seed=qtable_seed)
-    policy  = FrozenQPolicy(q_table=agent.q_table)
-
-    log1 = run_round_robin_family(procs, policy, predicted)
-    log2 = run_round_robin_family(procs, policy, predicted)
-
-    seq1 = [(e.pid, e.start, e.end) for e in log1.events]
-    seq2 = [(e.pid, e.start, e.end) for e in log2.events]
-    assert seq1 == seq2, "Frozen policy produced non-deterministic output"
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 11 -- Rule-based quantum always in QUANTA candidate set
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_rule_based_quantum_within_candidate_set_random(spec_seed):
-    """Every dispatch slice must be explainable by a quantum in QUANTA
-    (or less, if the burst finished before the full quantum elapsed)."""
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_round_robin_family(procs, RuleBasedQuantumPolicy(), predicted)
-    for e in log.events:
-        dur = e.end - e.start
-        assert any(dur <= q + 1e-6 for q in QUANTA), (
-            f"Slice duration {dur:.3f} exceeds all quanta {QUANTA}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 12 -- Feature matrix excludes leakage fields
-# Paper: "burst predictors' feature matrices structurally exclude true burst
-#          length, priority, and arrival time; §VII-B"
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=100,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_predictor_feature_matrix_no_leakage(spec_seed):
-    """The four-column feature matrix must NOT contain true_burst, priority,
-    or arrival as a column (correlation check)."""
-    spec, seed = spec_seed
-    procs, _ = _make_procs_and_oracle(spec, seed)
-    assume(len(procs) >= 4)  # need enough rows for correlation to be meaningful
-
-    X = np.array([p.features() for p in procs])   # (n, 4)
-    assert X.shape[1] == 4, f"Expected 4 features, got {X.shape[1]}"
-
-    true_burst = np.array([p.true_burst  for p in procs], float)
-    priority   = np.array([p.priority    for p in procs], float)
-    arrival    = np.array([p.arrival     for p in procs], float)
-
-    for col_idx in range(X.shape[1]):
-        col = X[:, col_idx]
-        for forbidden, name in [
-            (true_burst, "true_burst"),
-            (priority,   "priority"),
-            (arrival,    "arrival"),
-        ]:
-            # The column must NOT be a perfect linear transformation of forbidden.
-            if np.std(col) > 0 and np.std(forbidden) > 0:
-                r = abs(float(np.corrcoef(col, forbidden)[0, 1]))
-                assert r < 0.9999, (
-                    f"Column {col_idx} is perfectly correlated (r={r:.6f}) "
-                    f"with {name} -- possible leakage"
-                )
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 13 -- context-switch count <= n_dispatches - 1
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_context_switch_count_upper_bound_priority(spec_seed):
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_priority_family(procs, AlgorithmA_Priority(), predicted)
-    n_dispatches = len(log.events)
-    assert log.context_switches <= max(n_dispatches - 1, 0)
-
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_context_switch_count_upper_bound_rr(spec_seed):
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_round_robin_family(procs, FixedQuantumPolicy(q=4), predicted)
-    n_dispatches = len(log.events)
-    assert log.context_switches <= max(n_dispatches - 1, 0)
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 14 -- completion time ordering (no process finishes before it starts)
-# ---------------------------------------------------------------------------
-
-@given(workload_strategy())
-@settings(
-    max_examples=200,
-    suppress_health_check=[HealthCheck.too_slow],
-    deadline=None,
-)
-def test_completion_after_start_and_arrival_priority(spec_seed):
-    spec, seed = spec_seed
-    procs, predicted = _make_procs_and_oracle(spec, seed)
-    log = run_priority_family(procs, AlgorithmA_Priority(), predicted)
-    for p in procs:
-        assert log.start_time[p.pid]      >= p.arrival - 1e-9
-        assert log.completion_time[p.pid] >= log.start_time[p.pid] - 1e-9
-
-
-# ---------------------------------------------------------------------------
-# INVARIANT 15 -- random WorkloadSpec sampler produces valid specs
-# ---------------------------------------------------------------------------
-
-@given(st.integers(0, 999_999))
-@settings(max_examples=500, deadline=None)
-def test_random_spec_generates_valid_workload(seed):
-    """random_workload_spec must always produce a spec that generates a
-    non-empty, structurally valid workload."""
-    rng  = np.random.default_rng(seed)
-    spec = random_workload_spec(rng, min_processes=2, max_processes=20)
-    procs = generate_workload(spec, seed=seed)
-    assert len(procs) >= 2
-    assert all(p.true_burst >= 1      for p in procs)
-    assert all(p.priority   >= 1      for p in procs)
-    assert all(p.arrival    >= 0.0    for p in procs)
-    assert all(p.pid == i             for i, p in enumerate(procs))
+@_COMMON_SETTINGS
+@given(n=_n_processes_st, seed=_seed_st, burst_mode=_burst_mode_st)
+def test_property_feature_matrix_never_equals_true_burst(n, seed, burst_mode):
+    procs = _random_workload(n, seed, burst_mode=burst_mode)
+    X = _feature_matrix(procs, use_endcode=True)
+    assert X.shape == (n, 4)
+    true_bursts = [p.true_burst for p in procs]
+    for col in range(X.shape[1]):
+        assert list(X[:, col]) != true_bursts

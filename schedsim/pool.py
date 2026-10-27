@@ -1,180 +1,80 @@
 """
-Accumulating training data pool for the ML burst-length predictors.
+Append-only training pool for the continuous-training flywheel (`train.py`).
 
-The pool is an append-only CSV that stores (feature_vector, true_burst) rows
-collected from randomly generated workloads across multiple training runs.
-Re-training on the full pool after each run implements a data-flywheel: the
-effective training set grows with every call to `train.py run`, progressively
-improving prediction RMSE on the frozen evaluation set.
-
-On-disk layout (inside the repo root):
-    data/
-        training_pool.csv    -- accumulated feature rows
-        pool_meta.json       -- provenance: n_rows, n_runs, spec distribution
-
-The pool is append-only; rows are never modified or deleted. This gives full
-auditability: the CSV can be opened in any spreadsheet tool to inspect the
-training data used by any model checkpoint.
+Workloads are sampled from the combinatorial specification space (the same
+categories defined in workload.py) using seeds strictly disjoint from the
+train/val/test evaluation splits, and the resulting per-process feature/burst
+rows are appended to a CSV file that only ever grows -- so repeated training
+rounds accumulate more data for the burst predictors to refit on, rather
+than re-deriving a fixed sample each time.
 """
 from __future__ import annotations
 
 import csv
-import json
 import os
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+import random
+from typing import List
 
-import numpy as np
+from .workload import Process, WorkloadSpec, generate_workload, in_distribution_categories
 
-from .workload import Process
+POOL_PATH_DEFAULT = "training_pool.csv"
+# Strictly disjoint from SEED_OFFSETS["train"/"val"/"test"] in workload.py
+# (which top out at 2_000_000 + 50*10_000 = 2_500_000), so pool data can
+# never accidentally coincide with an evaluation workload.
+POOL_SEED_RANGE = (3_000_000, 4_000_000)
 
-_POOL_CSV  = "training_pool.csv"
-_META_JSON = "pool_meta.json"
-
-_FIELDNAMES = [
-    "vsize", "text", "endcode", "vmlib", "true_burst",
-    "spec_name", "seed", "n_processes", "added_at",
-]
+_FIELDS = ["pid", "arrival", "priority", "true_burst", "vsize", "text", "endcode", "vmlib"]
 
 
-@dataclass
-class PoolMeta:
-    n_rows: int = 0
-    n_runs: int = 0
-    created_at: str = ""
-    last_updated_at: str = ""
-    spec_counts: Dict[str, int] = field(default_factory=dict)
-
-    @property
-    def n_unique_specs(self) -> int:
-        return len(self.spec_counts)
+def _process_to_row(p: Process) -> dict:
+    return {"pid": p.pid, "arrival": p.arrival, "priority": p.priority,
+            "true_burst": p.true_burst, "vsize": p.vsize, "text": p.text,
+            "endcode": p.endcode, "vmlib": p.vmlib}
 
 
-class TrainingPool:
-    """Persistent, append-only store of (features, true_burst) rows.
+def append_to_pool(n_workloads: int, pool_path: str = POOL_PATH_DEFAULT,
+                    seed: int = None, n_processes: int = 24) -> int:
+    """Generate `n_workloads` random (category, seed) workloads from the
+    pool's disjoint seed range, append every process's row to `pool_path`
+    (creating it with a header if it doesn't exist yet), and return the
+    number of process-rows appended."""
+    rng = random.Random(seed)
+    specs = in_distribution_categories(n_processes)
+    file_exists = os.path.isfile(pool_path)
+    rows_written = 0
 
-    Thread-safety: not guaranteed. Use a single writer process.
-    """
+    with open(pool_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        for _ in range(n_workloads):
+            spec = rng.choice(specs)
+            workload_seed = rng.randrange(*POOL_SEED_RANGE)
+            procs = generate_workload(spec, workload_seed)
+            for p in procs:
+                writer.writerow(_process_to_row(p))
+                rows_written += 1
 
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        self._csv_path  = os.path.join(data_dir, _POOL_CSV)
-        self._meta_path = os.path.join(data_dir, _META_JSON)
-        os.makedirs(data_dir, exist_ok=True)
-        self._meta = self._load_meta()
+    return rows_written
 
-    # ------------------------------------------------------------------
-    # Writing
-    # ------------------------------------------------------------------
 
-    def append(self, procs: List[Process], spec_name: str, seed: int) -> int:
-        """Append every process from one workload to the pool.
+def load_pool(pool_path: str = POOL_PATH_DEFAULT) -> List[Process]:
+    """Load every process-row ever appended to the pool as a flat list of
+    Process objects (pid is re-numbered 0..n-1 since the pool mixes many
+    workloads and pid is only meaningful within a single workload)."""
+    if not os.path.isfile(pool_path):
+        return []
+    procs = []
+    with open(pool_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            procs.append(Process(
+                pid=i, arrival=float(row["arrival"]), priority=int(row["priority"]),
+                true_burst=int(float(row["true_burst"])), vsize=float(row["vsize"]),
+                text=float(row["text"]), endcode=float(row["endcode"]), vmlib=float(row["vmlib"]),
+            ))
+    return procs
 
-        Parameters
-        ----------
-        procs:     List[Process] from `generate_workload`.
-        spec_name: The WorkloadSpec.name used to generate this workload.
-        seed:      The integer seed passed to `generate_workload`.
 
-        Returns
-        -------
-        Number of rows appended (== len(procs)).
-        """
-        ts = datetime.now(timezone.utc).isoformat()
-        rows = [
-            {
-                "vsize":       round(p.vsize,   6),
-                "text":        round(p.text,    6),
-                "endcode":     round(p.endcode, 6),
-                "vmlib":       round(p.vmlib,   6),
-                "true_burst":  p.true_burst,
-                "spec_name":   spec_name,
-                "seed":        seed,
-                "n_processes": len(procs),
-                "added_at":    ts,
-            }
-            for p in procs
-        ]
-        write_header = not os.path.exists(self._csv_path)
-        with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
-            if write_header:
-                writer.writeheader()
-            writer.writerows(rows)
-
-        self._meta.n_rows += len(rows)
-        self._meta.n_runs += 1
-        self._meta.spec_counts[spec_name] = (
-            self._meta.spec_counts.get(spec_name, 0) + len(rows)
-        )
-        if not self._meta.created_at:
-            self._meta.created_at = ts
-        self._meta.last_updated_at = ts
-        self._save_meta()
-        return len(rows)
-
-    # ------------------------------------------------------------------
-    # Reading
-    # ------------------------------------------------------------------
-
-    def load_xy(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return ``(X, y)`` arrays from the entire pool.
-
-        X  shape (n, 4): [vsize, text, endcode, vmlib]
-        y  shape (n,):   true_burst values
-        """
-        if not os.path.exists(self._csv_path):
-            raise FileNotFoundError(
-                f"Pool CSV not found at {self._csv_path}.\n"
-                "Run `python train.py run` to generate training data first."
-            )
-        xs, ys = [], []
-        with open(self._csv_path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                xs.append([
-                    float(row["vsize"]),
-                    float(row["text"]),
-                    float(row["endcode"]),
-                    float(row["vmlib"]),
-                ])
-                ys.append(float(row["true_burst"]))
-        if not xs:
-            raise ValueError("Training pool CSV exists but is empty.")
-        return np.array(xs), np.array(ys)
-
-    # ------------------------------------------------------------------
-    # Introspection
-    # ------------------------------------------------------------------
-
-    @property
-    def size(self) -> int:
-        """Total number of (feature, burst) rows in the pool."""
-        return self._meta.n_rows
-
-    @property
-    def meta(self) -> PoolMeta:
-        return self._meta
-
-    def __repr__(self) -> str:
-        m = self._meta
-        return (
-            f"TrainingPool({m.n_rows:,} rows | {m.n_runs} runs | "
-            f"{m.n_unique_specs} unique specs | "
-            f"last updated {m.last_updated_at or 'never'})"
-        )
-
-    # ------------------------------------------------------------------
-    # Internal persistence helpers
-    # ------------------------------------------------------------------
-
-    def _load_meta(self) -> PoolMeta:
-        if os.path.exists(self._meta_path):
-            with open(self._meta_path, encoding="utf-8") as f:
-                d = json.load(f)
-            return PoolMeta(**d)
-        return PoolMeta()
-
-    def _save_meta(self):
-        with open(self._meta_path, "w", encoding="utf-8") as f:
-            json.dump(asdict(self._meta), f, indent=2)
+def pool_size(pool_path: str = POOL_PATH_DEFAULT) -> int:
+    return len(load_pool(pool_path))

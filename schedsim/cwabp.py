@@ -109,62 +109,123 @@ class ExponentialAveragingPredictor:
         self._estimate[b.process_id] = self.beta * actual + (1 - self.beta) * prev
 
 
-class CWABPPredictor:
-    name = "cwabp"
+def _window_regression(hist: List[Tuple[float, float]], min_samples: int,
+                        feature: float, exp_est: float) -> Tuple[Optional[float], float]:
+    """Shared regression step for every window-based predictor below.
+    Returns (clamped_regression_prediction_or_None, sample_correlation_r).
+    None means "too little history" -- the caller must fall back to the
+    exponential-averaging estimate. The trust-region clamp (log-space,
+    within a factor of 5x the exponential-averaging estimate) guards against
+    a spurious small-window correlation combining with an out-of-range
+    feature value to extrapolate to an absurd (or exp()-overflowing) length;
+    this is the same safeguard for every predictor that uses regression at
+    all, not just CWABP, so the comparison in Section IV is apples-to-apples.
+    """
+    if len(hist) < min_samples:
+        return None, 0.0
+    xs = np.array([h[0] for h in hist])
+    ys = np.array([h[1] for h in hist])
+    var_x, var_y = xs.var(), ys.var()
+    if var_x < 1e-9 or var_y < 1e-9:
+        r = 0.0
+    else:
+        r = float(np.corrcoef(xs, ys)[0, 1])
 
-    def __init__(self, window: int = 8, shrink: float = 0.5, min_samples: int = 3,
-                 beta: float = 0.5, initial: float = 10.0):
+    if abs(r) > 1e-9 and var_x > 1e-9:
+        slope = np.cov(xs, ys, bias=True)[0, 1] / var_x
+        intercept = ys.mean() - slope * xs.mean()
+        log_exp_est = math.log(max(exp_est, 1e-6))
+        raw_log_pred = intercept + slope * feature
+        clamped_log_pred = float(np.clip(raw_log_pred, log_exp_est - math.log(5.0),
+                                          log_exp_est + math.log(5.0)))
+        reg_pred = math.exp(clamped_log_pred)
+    else:
+        reg_pred = exp_est
+    return reg_pred, r
+
+
+class _WindowedPredictorBase:
+    """Shared history/state machinery for every predictor that maintains a
+    per-process sliding window of (feature, log-burst) pairs alongside an
+    exponential-averaging baseline. Subclasses implement only `predict`."""
+
+    def __init__(self, window: int = 8, min_samples: int = 3, beta: float = 0.5,
+                 initial: float = 10.0):
         self.window = window
-        self.shrink = shrink
         self.min_samples = min_samples
         self.beta = beta
         self.initial = initial
         self._history: Dict[int, List[Tuple[float, float]]] = {}  # pid -> [(x, log_y)]
         self._exp_estimate: Dict[int, float] = {}
 
-    def predict(self, b: Burst) -> float:
+    def _state(self, b: Burst) -> Tuple[List[Tuple[float, float]], float]:
         hist = self._history.get(b.process_id, [])[-self.window:]
         exp_est = self._exp_estimate.get(b.process_id, self.initial)
-
-        if len(hist) < self.min_samples:
-            return exp_est
-
-        xs = np.array([h[0] for h in hist])
-        ys = np.array([h[1] for h in hist])
-        var_x, var_y = xs.var(), ys.var()
-        if var_x < 1e-9 or var_y < 1e-9:
-            r = 0.0
-        else:
-            r = float(np.corrcoef(xs, ys)[0, 1])
-
-        weight = float(np.clip(self.shrink * (r ** 2), 0.0, 1.0))
-
-        if abs(r) > 1e-9 and var_x > 1e-9:
-            slope = np.cov(xs, ys, bias=True)[0, 1] / var_x
-            intercept = ys.mean() - slope * xs.mean()
-            # Trust-region clamp: with a small window, a spurious high sample
-            # correlation can combine with an out-of-sample `feature` value
-            # to extrapolate the regression component to an absurd (or even
-            # exp()-overflowing) length. Clamp the LOG-space argument first
-            # (so we never overflow math.exp itself), then clip the result
-            # to within a factor of 5x the exponential-averaging baseline,
-            # which keeps a high weight's effect meaningful without letting
-            # a single noisy window dominate the estimate.
-            log_exp_est = math.log(max(exp_est, 1e-6))
-            raw_log_pred = intercept + slope * b.feature
-            clamped_log_pred = float(np.clip(raw_log_pred, log_exp_est - math.log(5.0),
-                                              log_exp_est + math.log(5.0)))
-            reg_pred = math.exp(clamped_log_pred)
-        else:
-            reg_pred = exp_est
-
-        blended_log = weight * math.log(max(reg_pred, 1e-6)) + (1 - weight) * math.log(max(exp_est, 1e-6))
-        return max(math.exp(blended_log), 1.0)
+        return hist, exp_est
 
     def observe(self, b: Burst, actual: float):
         prev = self._exp_estimate.get(b.process_id, self.initial)
         self._exp_estimate[b.process_id] = self.beta * actual + (1 - self.beta) * prev
         self._history.setdefault(b.process_id, []).append((b.feature, math.log(max(actual, 1e-6))))
+
+    def predict(self, b: Burst) -> float:
+        raise NotImplementedError
+
+
+class CWABPPredictor(_WindowedPredictorBase):
+    """Correlation-Weighted Adaptive Burst Predictor: blends the regression
+    prediction with the exponential-averaging baseline, weighted by shrunk
+    squared sample correlation (Eq. 6 of the paper)."""
+    name = "cwabp"
+
+    def __init__(self, window: int = 8, shrink: float = 0.5, min_samples: int = 3,
+                 beta: float = 0.5, initial: float = 10.0):
+        super().__init__(window, min_samples, beta, initial)
+        self.shrink = shrink
+
+    def predict(self, b: Burst) -> float:
+        hist, exp_est = self._state(b)
+        reg_pred, r = _window_regression(hist, self.min_samples, b.feature, exp_est)
+        if reg_pred is None:
+            return exp_est
+        weight = float(np.clip(self.shrink * (r ** 2), 0.0, 1.0))
+        blended_log = weight * math.log(max(reg_pred, 1e-6)) + (1 - weight) * math.log(max(exp_est, 1e-6))
+        return max(math.exp(blended_log), 1.0)
+
+
+class RegressionOnlyPredictor(_WindowedPredictorBase):
+    """CWABP's window-regression component in isolation: once enough
+    history exists, the regression prediction is used outright (weight 1),
+    with no correlation-based shrinkage -- this isolates how much of
+    CWABP's behaviour comes from "having a regression at all" versus from
+    adaptively trusting it only when it has recently been predictive."""
+    name = "regression_only"
+
+    def predict(self, b: Burst) -> float:
+        hist, exp_est = self._state(b)
+        reg_pred, _r = _window_regression(hist, self.min_samples, b.feature, exp_est)
+        return exp_est if reg_pred is None else reg_pred
+
+
+class FixedWeightPredictor(_WindowedPredictorBase):
+    """Same blend formula as CWABP (Eq. 6), but with a constant regression
+    weight instead of one derived from the observed correlation -- isolates
+    whether CWABP's *adaptive* weighting specifically helps, versus just
+    blending in some fixed amount of regression unconditionally."""
+    name = "fixed_weight"
+
+    def __init__(self, weight: float = 0.5, window: int = 8, min_samples: int = 3,
+                 beta: float = 0.5, initial: float = 10.0):
+        super().__init__(window, min_samples, beta, initial)
+        self.weight = weight
+
+    def predict(self, b: Burst) -> float:
+        hist, exp_est = self._state(b)
+        reg_pred, _r = _window_regression(hist, self.min_samples, b.feature, exp_est)
+        if reg_pred is None:
+            return exp_est
+        blended_log = self.weight * math.log(max(reg_pred, 1e-6)) + (1 - self.weight) * math.log(max(exp_est, 1e-6))
+        return max(math.exp(blended_log), 1.0)
 
 
 # --------------------------- SRTF simulation --------------------------------
@@ -176,6 +237,7 @@ class SRTFResult:
     avg_response: float
     p95_waiting: float
     preemptions: int
+    context_switches: int
     mae: float
     rmse: float
     pearson: float
@@ -210,23 +272,37 @@ def simulate_srtf(n_processes: int, bursts_per_process: int, rho: float, sigma: 
     true_length_of: Dict[Tuple[int, int], float] = {}
     preds, actuals = [], []
     preemptions = 0
+    context_switches = 0
+    last_pid: Optional[int] = None
+    idle_break = True  # no "previous process" yet, so the first dispatch never counts
     n_expected = n_processes * bursts_per_process
 
     def key(b: Burst):
         return (b.process_id, b.burst_index)
 
+    def set_running(entry: dict):
+        """Assign `running`, counting a context switch whenever this dispatch
+        follows a *different* process with no intervening idle interval --
+        the same convention used by the main priority/RR engine."""
+        nonlocal running, last_pid, idle_break, context_switches
+        pid = entry["burst"].process_id
+        if not idle_break and last_pid is not None and pid != last_pid:
+            context_switches += 1
+        running = entry
+        start.setdefault(key(entry["burst"]), time)
+        last_pid = pid
+        idle_break = False
+
     def admit(entry: dict):
         """Insert a freshly materialised burst into running/ready, preempting
         the current running burst if its estimate is strictly smaller."""
-        nonlocal running, preemptions
+        nonlocal preemptions
         if running is None:
-            running = entry
-            start[key(entry["burst"])] = time
+            set_running(entry)
         elif entry["est"] < running["est"] - 1e-9:
             preemptions += 1
             ready.append(running)
-            running = entry
-            start[key(entry["burst"])] = time
+            set_running(entry)
         else:
             ready.append(entry)
 
@@ -248,10 +324,10 @@ def simulate_srtf(n_processes: int, bursts_per_process: int, rho: float, sigma: 
         if running is None:
             if ready:
                 ready.sort(key=lambda e: (e["est"], e["burst"].ready_time, e["burst"].process_id))
-                running = ready.pop(0)
-                start.setdefault(key(running["burst"]), time)
+                set_running(ready.pop(0))
             elif heap:
                 time = heap[0][0]
+                idle_break = True
                 materialise_due(time)
                 continue
             else:
@@ -297,6 +373,7 @@ def simulate_srtf(n_processes: int, bursts_per_process: int, rho: float, sigma: 
         avg_response=float(np.mean(response)),
         p95_waiting=float(np.percentile(waiting, 95, method="linear")),
         preemptions=preemptions,
+        context_switches=context_switches,
         mae=mae, rmse=rmse, pearson=pearson,
         n_bursts=len(preds),
     )

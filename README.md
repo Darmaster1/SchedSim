@@ -1,5 +1,21 @@
 # schedsim
 
+**Current focused study:** `paper/paper.pdf` is *"Correlation-Guided CPU
+Burst Prediction for SRTF Scheduling Under Changing Workloads"* -- a
+narrowly-scoped, statistically rigorous comparison of CWABP against three
+fair baselines (exponential averaging, regression-only, fixed-weight) on
+SRTF scheduling. Run it with:
+```bash
+python cwabp_study.py                 # validation sweep + frozen test run
+pytest tests/test_cwabp.py tests/test_worked_example.py tests/test_properties.py -v
+```
+This repository also contains a broader, separately-scoped six-algorithm
+scheduling study (Priority Scheduling, Round Robin, Q-learning) described
+below -- the two studies share the simulator's core but are evaluated and
+reported independently; the current paper does not draw on the six-algorithm
+results.
+
+
 A discrete-event simulator comparing **ML-assisted priority scheduling** and
 **RL-based adaptive Round Robin** against classical baselines, plus a
 **correlation-weighted burst predictor (CWABP)** extension for SRTF

@@ -2,12 +2,11 @@
 
 % ---------------------------------------------------------------------
 % IEEE-conference-style formatting built on the standard article class.
-% (The genuine IEEEtran.cls could not be fetched in this build
-%  environment, which has no network access to CTAN/texlive mirrors.
-%  For camera-ready IEEE submission, swap the preamble below for:
-%    \documentclass[conference]{IEEEtran}
-%  and drop this formatting block -- no other changes are required,
-%  since no IEEEtran-specific macros are used in the body below.)
+% (Genuine IEEEtran.cls could not be fetched in this build environment,
+%  which has no network access to CTAN/texlive mirrors. For camera-ready
+%  IEEE submission, swap the preamble for \documentclass[conference]{IEEEtran}
+%  -- no other change is required, since no IEEEtran-specific macros are
+%  used in the body below.)
 % ---------------------------------------------------------------------
 \usepackage[letterpaper, margin=0.7in, columnsep=0.25in, top=0.7in]{geometry}
 \usepackage{times}
@@ -22,11 +21,6 @@
 \usepackage[hidelinks]{hyperref}
 \usepackage{titlesec}
 \usepackage{balance}
-\usepackage{seqsplit}
-\usepackage[ruled,linesnumbered,vlined]{algorithm2e}
-\SetAlFnt{\small}
-\SetAlCapFnt{\small}
-\SetAlCapNameFnt{\small}
 \setlength{\parindent}{1em}
 \setlength{\columnsep}{0.25in}
 
@@ -35,10 +29,10 @@
 \titlespacing*{\section}{0pt}{0.9em}{0.5em}
 \titlespacing*{\subsection}{0pt}{0.7em}{0.3em}
 
-\title{\vspace{-1em}\fontsize{14.5}{16.5}\selectfont\bfseries Machine Learning-Assisted Priority Scheduling and\\Reinforcement Learning-Based Adaptive Round Robin:\\A Simulation Study with a Correlation-Guided Burst Predictor}
+\title{\vspace{-1em}\fontsize{14.5}{16.5}\selectfont\bfseries Correlation-Guided CPU Burst Prediction for SRTF Scheduling Under Changing Workloads}
 
 \author{
-\normalsize Dr Sudhamani MJ, Aaditya Kumar, Mohnish Tulsian, Achintya B S\\
+\normalsize Aaditya Kumar, Mohnish Tulsian, Sudhamani MJ, Achintya B S,\\
 \small Department of Computer Science and Engineering -- Artificial Intelligence and Machine Learning\\
 \small PES University, Bangalore, India
 }
@@ -50,274 +44,220 @@
     \maketitle
     \begin{abstract}
     \noindent\small
-    Classical CPU scheduling policies are near-optimal when a process's next CPU burst length is known in advance, yet this length is never observable in real systems. We present a discrete-event simulation comparing six scheduling algorithms built around this information gap: non-preemptive Priority Scheduling (A); a Weighted ML variant (B) blending a regression-predicted burst length into the priority score; a Protected ML variant (C) adding anti-starvation safeguards to B; fixed-quantum Round Robin (D); a rule-based adaptive Round Robin (E); and a Round Robin variant whose quantum is chosen by a tabular Q-learning agent (F). We further propose and evaluate a Correlation-Weighted Adaptive Burst Predictor (CWABP) for Shortest-Remaining-Time-First scheduling against classical exponential averaging. All six algorithms, five burst-prediction models, the Q-learning agent, and CWABP are implemented in an open-source simulator (\texttt{schedsim}), evaluated by a 52-test verification suite (42 unit/invariant tests plus 10 Hypothesis property-based suites) and a continuous training flywheel that lets the predictor and Q-agent keep improving across repeated rounds. Every number reported here is genuine code output. On a pilot-scale run (25 processes/workload, 65 paired test workloads), Weighted ML Priority Scheduling reduces mean waiting time by $32\%$ over traditional Priority Scheduling ($p<10^{-9}$, Wilcoxon, Holm-corrected), while the Protected variant trades back part of that gain for a $26\%$ reduction in worst-case waiting. Neither adaptive Round Robin policy outperformed fixed-quantum Round Robin at this scale, a negative result reported plainly. CWABP matched or modestly improved on exponential averaging across all seven tested I/O workload types, with the largest gains ($-5.7\%$ waiting time, $-25\%$ RMSE) on a feature-driven, phase-changing workload. All findings are pilot-scale; the exact reproduction and scale-up commands are given in \S VIII.
+    Shortest-Remaining-Time-First (SRTF) scheduling needs an estimate of each process's next CPU burst, and the classical exponential-averaging estimator ignores any signal observable before a burst begins. We study the Correlation-Weighted Adaptive Burst Predictor (CWABP), which blends a window-regression estimate from an observable per-burst feature with exponential averaging, weighted by the feature's recently-demonstrated predictive value. To isolate what actually drives CWABP's behaviour, we compare it against three fair baselines on the same SRTF scheduler and synthetic workloads: exponential averaging alone, the regression component alone, and a fixed-weight version of CWABP's own blend formula. A validation-selected configuration is frozen before a disjoint set of 10 test seeds per workload, across seven workload types, is evaluated once; paired Wilcoxon tests with Holm correction and bootstrap confidence intervals are reported per workload type rather than pooled. CWABP significantly reduces mean waiting time versus exponential averaging on four of seven workload types (feature-driven strong/moderate correlation, phase-change, heavy-tailed), but does \emph{not} consistently beat the simpler regression-only or fixed-weight baselines -- on several workloads it is significantly \emph{worse} than one or both. We report these results exactly as measured, including cases where confidence intervals include zero, and discuss why lower prediction RMSE does not always translate into lower waiting time. A worked three-process example, with hand-derived predictions checked against the implementation to machine precision, documents CWABP's exact information boundary and its fallback behaviour under insufficient history and zero feature variance.
     \end{abstract}
     \vspace{0.5em}
-    \textbf{\small Index Terms}---\small CPU scheduling, Priority Scheduling, Round Robin, time quantum, burst prediction, exponential averaging, SRTF, reinforcement learning, Q-learning, fairness, starvation.
+    \textbf{\small Index Terms}---\small SRTF scheduling, CPU burst prediction, exponential averaging, correlation-weighted regression, adaptive prediction.
     \vspace{1em}
   \end{@twocolumnfalse}
 ]
 
 \section{Introduction}
-A CPU scheduler must repeatedly decide which ready process runs next. Classical policies such as Shortest Job First and Shortest-Remaining-Time-First (SRTF) are provably strong \emph{if} the scheduler knows each process's remaining burst length in advance; real schedulers never have this information and rely on static priorities, fixed time slices, or simple estimators \cite{silberschatz2013}. This paper investigates, through simulation rather than kernel modification, whether (i) a machine-learning estimate of burst length can improve priority-based scheduling, and (ii) a Round Robin (RR) time quantum chosen adaptively -- by hand-written rules or by a reinforcement learning (RL) agent -- outperforms a fixed quantum. A 2017 survey \cite{dias2017} motivates this question; Section II re-checks its central claims against primary sources rather than repeating them.
+Shortest-Remaining-Time-First (SRTF) scheduling is optimal for average waiting time when the scheduler knows each process's remaining CPU burst exactly; real schedulers never have this information and fall back on estimators. The textbook estimator, exponential averaging (EA), uses only a process's own burst history and adapts slowly after a genuine change in behaviour \cite{silberschatz2013}. If some other observable quantity -- for instance, the amount of data returned by the I/O operation immediately preceding a burst -- is informative about the upcoming burst length, a scheduler could in principle do better by incorporating it.
 
-This paper makes no claim that ML or RL improves scheduling in general; it tests whether, and under what pilot-scale conditions, these methods help, treating fairness loss, tail-latency cost, and context-switch overhead as first-class outcomes. All code is open-source and every table here is generated directly from it (\S VII).
+This paper studies one specific proposal for doing so: the \textbf{Correlation-Weighted Adaptive Burst Predictor (CWABP)}, which maintains a sliding window of (feature, burst) pairs per process, fits a regression within that window, and blends the regression prediction with the EA baseline, weighted by how strongly correlated the feature has recently been. The central question is not just whether CWABP beats EA, but \emph{why}: is it because having a regression at all helps, or specifically because CWABP's adaptive weighting decides when to trust it? To answer this we compare CWABP against three baselines under an identical SRTF scheduler -- EA alone, the window-regression alone, and a fixed-weight version of CWABP's own blend formula -- which isolates each design choice in turn.
 
-\textbf{Contributions.} (1) A single open-source simulator evaluating all six algorithms under identical workloads and counting conventions; (2) a statistically tested comparison between performance-oriented and fairness-protected ML priority ranking; (3) separate accounting of burst-prediction accuracy versus scheduling outcome; (4) a frozen evaluation protocol for CWABP against exponential averaging, run end-to-end; (5) a continuous training flywheel that refits predictors and resumes Q-learning across repeated rounds, so the system keeps improving with more compute rather than being a one-shot batch job; and (6) full transparency about pilot-scale limitations, including implementation bugs this project's own test suite caught during development (\S VII-D).
+\textbf{Contributions.} (1) A corrected, structurally-verified implementation of CWABP with a documented information boundary, including a hand-worked three-process example checked against the code to machine precision; (2) three fair baseline predictors sharing CWABP's own window, fallback, and numerical-safety machinery, so differences in outcome are attributable to the prediction rule and not to incidental implementation differences; (3) a frozen, validation-selected evaluation protocol with disjoint development/validation/test seeds, evaluated once; (4) per-workload paired statistical tests with multiple-comparison correction, reporting non-significant results plainly rather than only favourable ones; and (5) an explicit discussion of where CWABP helps, where it does not, and why reduced prediction error does not always imply reduced waiting time.
 
 \section{Related Work}
-We re-verified the central claims of a 2017 survey \cite{dias2017} against original sources (Table~\ref{tab:related}). Negi and Kishore \cite{negi2005} modified a Linux 2.4 kernel scheduler and report a 1.4--5.8\% turnaround-time reduction via decision-tree-learned time-slice classes -- confirmed at the abstract level. Helmy et al.\ \cite{helmy2015} report strong grid-burst prediction (k-NN best) on the GWA-T-4 trace; the specific correlation/RAE figures quoted by the survey were not independently re-verified. Two sources cited only through the survey (a 2004 Negi \& Kishore paper and a Dolev/Mendelson/Shilman technical report) could not be located.
+A 2017 survey \cite{dias2017} reviews early work on learning process behaviour for scheduling; its central claims were checked against primary sources in prior work from this project. Negi and Kishore \cite{negi2005} modified a Linux 2.4 kernel scheduler and report a turnaround-time reduction from decision-tree-learned time-slice classes, attributed to fewer context switches. Helmy et al.\ \cite{helmy2015} compare several regression models (SVM, k-NN, ANN, decision trees) for CPU-burst estimation on grid traces, reporting k-NN as the strongest predictor; this motivates treating burst prediction as a regression problem, as CWABP's window-regression component does, though their setting (grid jobs, no scheduling simulation) differs from ours. Classical exponential averaging itself is the standard SJF/SRTF estimator in operating-systems textbooks \cite{silberschatz2013} and is the primary baseline throughout this paper.
 
-More recent dynamic-quantum RR work includes DABRR \cite{dash2016}, an effective-time-slice RR \cite{tajwar2017}, $k$-means-based RR \cite{mostafa2020}, and an agent-based adaptive RR compared against twelve baselines \cite{khan2025}. RL has been applied to real scheduler parameters by Han and Lee \cite{han2020} (Android's Energy-Aware Scheduler) and, in preprint form, to general adaptive resource scheduling \cite{li2024}. Within a necessarily limited search, we did not find a peer-reviewed study comparing fixed, rule-based, and Q-learning RR quantum selection together under shared tie-breaking rules while reporting worst-case waiting and starvation counts, nor a protected-vs-unprotected ML priority comparison reporting explicit inversion and starvation statistics -- the gap this study targets.
+To our knowledge, no prior work isolates \emph{which part} of a correlation-weighted burst predictor is responsible for its performance by comparing it against both a pure-regression and a fixed-weight ablation on the same scheduler -- the comparison this paper runs. We do not claim adaptive burst prediction itself is new; our contribution is the controlled ablation and the honest, per-workload statistical account of when it helps.
 
-\begin{table*}[ht]
-\centering
-\caption{Positioning relative to closely related work.}
-\label{tab:related}
-\scriptsize
-\setlength{\tabcolsep}{2.6pt}
-\begin{tabular}{lp{3.3cm}l}
-\toprule
-\textbf{Work} & \textbf{Technique} & \textbf{Evaluated against} \\
-\midrule
-\cite{negi2005} & Decision-tree time-slice classes, real kernel & Turnaround time only \\
-\cite{helmy2015} & SVM/k-NN/ANN/DT burst estimation & Grid traces, no scheduling sim \\
-\cite{dash2016,tajwar2017} & Rule-based dynamic RR quantum & AWT/ATAT, single RR variant \\
-\cite{mostafa2020} & $k$-means-based RR quantum & Not fully verified \\
-\cite{khan2025} & Agent-based rules, 12-way comparison & No worst-case/starvation metrics \\
-\cite{han2020} & Policy-gradient RL, real scheduler & Android power/benchmarks \\
-\cite{li2024} & Q-learning, general resources & Preprint, unreviewed \\
-\textbf{This work} & \textbf{5 ML models + rules + tabular Q-learning, 6-way} & \textbf{Worst-case, starvation, fairness, stat. tests, property-based verification} \\
-\bottomrule
-\end{tabular}
-\end{table*}
+\section{Proposed Method}
 
-\section{System Design}
-
-\subsection{Simulator Architecture}
-\texttt{schedsim} runs five stages in sequence: (1) seeded workload generation, (2) burst-length prediction fitted on training data and selected on validation data, (3) discrete-event scheduling restricted to observable information, (4) metrics computation from the event log, and (5) statistical analysis. RR quantum policies (E, F) never receive true burst lengths or future arrivals -- only queue length, accumulated waiting time, and \emph{predicted} remaining bursts.
-
-\subsection{Synthetic Workloads}
-Each workload is a deterministic function of a specification and an integer seed; training, validation, and test splits use disjoint seed ranges. Each process carries four synthetic attributes $\{v_i,t_i,e_i,m_i\}$ (named after, but not drawn from, real Linux process fields). Writing $u_i = (\ln b_i - \bar{\mu})/\bar{\sigma}$ for the standardised log-burst length, each feature is generated as
+\subsection{Exponential Averaging Baseline}
+For burst $n$ with measured length $\tau_n$ and previous estimate $\hat\tau_{n-1}$:
 \begin{equation}
-z_{ij} = \rho_j u_i + \sqrt{1-\rho_j^2}\,\epsilon_{ij}, \qquad \epsilon_{ij}\sim\mathcal N(0,1),
-\label{eq:feature}
+\hat\tau_n = \beta\tau_n + (1-\beta)\hat\tau_{n-1}, \qquad \beta\in(0,1).
+\label{eq:ea}
 \end{equation}
-rescaled to a positive range; $\rho_j$ ranges from strong ($0.95$) to deliberately misleading ($-0.70$), making correlation strength a controllable design parameter. Ten in-distribution categories (burst-length distribution, arrival pattern, priority assignment, feature strength) appear in all three splits; three \emph{shifted} categories -- misleading features, heavy-tailed bursts, a 120-process queue -- appear only in the test split to probe generalisation.
+EA requires one stored value per process, adapts geometrically (weight $(1-\beta)^k$ retained after $k$ further bursts), and ignores any information available before a burst begins.
 
-\section{Algorithms and Machine-Learning Models}
-
-\subsection{Common Definitions}
-For process $i$ with arrival $a_i$, first dispatch $s_i$, completion $c_i$, true burst $b_i$: turnaround $T_i=c_i-a_i$, waiting $W_i=T_i-b_i$, response $R_i=s_i-a_i$. A context switch is charged ($1.0$ time unit in the main experiments) whenever dispatch switches between two different processes with no intervening idle interval.
-
-\subsection{Five Candidate Burst-Prediction Models}
-A real scheduler cannot observe future execution demand; candidate regressors predict $\hat b_i$ strictly from the four observable attributes above (true burst, arrival time, priority structurally excluded). We evaluate:
-
-\begin{enumerate}[leftmargin=1.1em,itemsep=1pt,topsep=2pt]
-\item \textbf{Linear} (OLS): $\hat y = w^\top x + b$ minimising residual sum of squares; $O(d)$ inference.
-\item \textbf{$k$-NN} ($k=5$): uniform average of the $k$ nearest historical processes in standardised Euclidean space; $O(N\!\cdot\! d)$ per query.
-\item \textbf{CART} (\texttt{max\_depth}=6): axis-aligned recursive partitioning minimising MSE.
-\item \textbf{Random Forest} (100 trees, \texttt{max\_depth}=8): bootstrap-aggregated CART ensemble.
-\item \textbf{SVR} (RBF kernel, $C{=}10$, $\epsilon{=}0.5$): $\epsilon$-insensitive margin regression in an RKHS.
-\end{enumerate}
-The model with lowest validation RMSE is passed to every downstream algorithm.
-
-\subsection{Priority Family (A, B, C)}
-\textbf{A} dispatches the ready process with smallest priority number (FCFS/ID tie-break), running to completion. \textbf{B} blends min-max normalised priority $\hat P_i$ and predicted burst $\hat B_i$ into $\mathrm{Score}_i=\alpha\hat P_i+(1-\alpha)\hat B_i$, dispatching the lowest score; $\alpha{=}1$ reproduces A exactly (unit-tested; \S VII-B). \textbf{C} adds two safeguards: a \emph{maximum-wait override} that, once any ready process has waited $\geq W_{\max}$, dispatches the earliest-arrived overdue process regardless of score; and \emph{bounded inversion}, restricting dispatch to processes within priority gap $G$ of the best ready priority otherwise. The override does \textbf{not} guarantee any process waits at most $W_{\max}$ -- it must still wait for the running process and earlier-arrived overdue peers -- so starvation-threshold violations (wait $>100$) are measured, not assumed away. $(W_{\max},G)$ are selected on validation data to minimise mean max-waiting subject to mean average waiting $\leq1.10\times$ Algorithm B's; when no candidate satisfies this, the feasible-closest candidate is used instead of an unvalidated default.
-
-\begin{algorithm}[h]
-\small
-\caption{Algorithm C: Protected ML Priority Scheduling}
-\label{alg:c}
-\KwIn{$R(t)$; priorities $p_i$; predicted bursts $\tilde b_i$; waits $w_i$; $W_{\max}$; $G$}
-\KwOut{Process $i^\star$ to dispatch}
-$O \gets \{\,i \in R(t) : w_i \geq W_{\max}\,\}$\;
-\eIf{$O \neq \emptyset$}{
-  $i^\star \gets \arg\min_{i \in O} (\mathrm{arrival}_i,\ i)$ \tcp*{override}
-}{
-  $p^\star \gets \min_{i \in R(t)} p_i$;\quad $E \gets \{\,i : p_i - p^\star \leq G\,\}$\;
-  $i^\star \gets \arg\min_{i \in E} \mathrm{Score}_i$ \tcp*{Score as in B}
-}
-\Return $i^\star$\;
-\end{algorithm}
-
-\subsection{Round Robin Family (D, E, F)}
-\textbf{D} is FIFO RR with constant quantum $q$, selected on validation data. \textbf{E} chooses a quantum index from the base index $j_0$ by two threshold shifts:
-\begin{equation}
-j = j_0 - \mathbb{1}[\bar b_{\mathrm{rem}} \!\geq\! \theta_b \,\vee\, L \!\geq\! \theta_L] + \mathbb{1}[w \!\geq\! \theta_w], \quad q=Q_{\mathrm{clip}(j,0,3)},
-\label{eq:rule-e}
-\end{equation}
-shrinking the quantum under heavy predicted load or a long queue $L$, growing it for a long-waiting process $w$; $(\theta_b,\theta_L,\theta_w,j_0)$ are selected by random search on validation data (\S VI-A). \textbf{F} replaces E's hand-written rule with a tabular Q-learning agent (\S IV-E), trained offline and evaluated with a frozen, exploration-off policy -- at evaluation time F is a fixed policy exactly like D and E, just one \emph{produced} by training.
-
-\subsection{Q-Learning Formulation (Algorithm F)}
-\textbf{State} ($|S|{=}144$): four binned observables -- queue length $L\in\{[1,4),[4,9),[9,\infty)\}$, mean predicted remaining burst $\bar b_{\mathrm{rem}}\in\{[0,4),[4,12),[12,30),[30,\infty)\}$, maximum queued wait $W_q\in\{[0,25),[25,100),[100,\infty)\}$, imbalance $I=\max(\tilde b)/\bar b_{\mathrm{rem}}\in\{[0,1.5),[1.5,3.0),[3.0,\infty)\}$: $4\times4\times3\times3=144$ states. \textbf{Action}: index into $Q=\{2,4,8,16\}$.
-
-\textbf{Reward} (implemented exactly as specified, not merely described):
-\begin{equation}
-\begin{split}
-r_t = -w_1\tfrac{\Delta W_t}{W_{\mathrm{ref}}} - w_2\tfrac{R^{\mathrm{first}}_t}{R_{\mathrm{ref}}} - w_3\tfrac{\min(S_t-1,S_{\max})}{S_{\mathrm{ref}}} \\
- - w_4\mathbb{1}[\mathrm{switch}] - w_5\,\mathrm{clip}\!\left(\tfrac{W^{\max}_t-W_{\mathrm{fair}}}{W_{\mathrm{fair}}},0,1\right)
-\end{split}
-\label{eq:reward}
-\end{equation}
-where $\Delta W_t$ is the step's increase in total queue waiting, $R_t^{\mathrm{first}}$ is response latency on first dispatch, $S_t$ is slowdown $T/b$ at completion, and $W_t^{\max}$ is the largest queued wait. Reference constants $W_{\mathrm{ref}}{=}160$, $R_{\mathrm{ref}}{=}50$, $S_{\mathrm{ref}}{=}10$, $S_{\max}{=}50$, $W_{\mathrm{fair}}{=}100$ scale each term to order one; the \emph{balanced} preset used throughout is $(w_1,\ldots,w_5){=}(1,0.5,0.5,0.2,0.2)$, with \emph{wait-only}, \emph{context-switch-heavy}, and \emph{fairness-heavy} presets also implemented.
-
-\textbf{Update} (Watkins' Q-learning \cite{watkins1992}):
-\begin{equation}
-Q(s,a)\leftarrow Q(s,a)+\eta\big[r+\gamma\max_{a'}Q(s',a')-Q(s,a)\big],
-\label{eq:qupdate}
-\end{equation}
-$\eta{=}0.15$, $\gamma{=}0.90$, $\varepsilon$-greedy decaying $1.0\!\to\!0.05$ over training. At evaluation, $\pi(s)=\arg\max_a Q(s,a)$ is frozen, ties favour the smaller quantum.
-
-
-\section{The CWABP Extension}
-Exponential averaging, $\hat\tau_n=\beta\tau_n+(1-\beta)\hat\tau_{n-1}$ ($\beta{=}0.5$), is the textbook SRTF/SJF estimator but adapts slowly and ignores signals observable \emph{before} a burst begins. We propose \textbf{CWABP}: given an observable per-burst scalar $x$ (e.g.\ preceding I/O size), maintain a sliding window of the last $K{=}8$ pairs $(x_j,\ln\tau_j)$ per process. With window sample correlation $r$, variance $s_{zz}$, and covariance $s_{zy}$ (zero if either variance is zero):
+\subsection{Window Regression}
+Suppose an observable scalar $x$ (e.g.\ preceding I/O size) is known at the moment a burst becomes ready. For a process about to start burst $n$, let its window contain the $m\leq K$ most recently completed bursts, with $z_j=x_j$, $y_j=\ln\tau_j$, sample means $\bar z,\bar y$, and sample variance/covariance $s_{zz},s_{zy}$. The window regression is:
 \begin{equation}
 b = \frac{s_{zy}}{s_{zz}}, \qquad \ln\hat\tau_{\mathrm{reg}} = \bar y + b(x-\bar z),
-\label{eq:cwabp-reg}
+\label{eq:reg}
 \end{equation}
-blended with the exponential-averaging baseline, weighted by shrunk squared correlation ($\lambda{=}0.5$):
+with $r$ the sample correlation (defined as $0$ if either variance is $0$, rather than left undefined). Because a small window's sample correlation is not reliably zero even for a genuinely uninformative feature ($\mathrm{sd}(r)\approx1/\sqrt{m-3}$ under independence), the regression is gated: it only activates once $m\geq m_{\min}$ (we use $m_{\min}{=}3$), and its log-space output is clamped to a trust region around the EA estimate,
 \begin{equation}
-\hat\tau_{\mathrm{CWABP}} = \exp\!\big(\lambda r^2 \ln\hat\tau_{\mathrm{reg}} + (1-\lambda r^2)\ln\hat\tau_{\mathrm{EA}}\big).
-\label{eq:cwabp-blend}
-\end{equation}
-Because sample correlation over a small window is not reliably zero under the null ($\mathrm{sd}(r)\approx1/\sqrt{K-3}$), two safeguards bound spurious extrapolation: a minimum-sample gate ($\geq3$ window observations before regression activates) and a \textbf{trust-region clamp} in log-space,
-\begin{equation}
-\ln\hat\tau_{\mathrm{reg}} \in \big[\ln\hat\tau_{\mathrm{EA}}-\ln 5,\ \ln\hat\tau_{\mathrm{EA}}+\ln 5\big],
+\ln\hat\tau_{\mathrm{reg}} \in \big[\ln\hat\tau_{\mathrm{EA}}-\ln5,\ \ln\hat\tau_{\mathrm{EA}}+\ln5\big],
 \label{eq:clamp}
 \end{equation}
-keeping the estimate within $[0.2\times,5.0\times]$ of the classical baseline and precluding numerical overflow. CWABP uses a different, multi-burst alternating CPU/I-O process model from the main study and is integrated into SRTF by re-estimating remaining time $\tilde\rho_j(t)=\max(1,\hat\tau_j-e_j)$ at each preemption check. It is evaluated on seven synthetic workload types spanning stable, feature-driven, uncorrelated, phase-changing, and correlation-reversing burst behaviour.
+precluding a spurious small-window correlation from extrapolating to an absurd (or numerically overflowing) length. This safeguard applies identically to every regression-using predictor below, so it cannot by itself explain a difference between them.
 
-\section{Experimental Methodology and Results}
+\subsection{Three Predictors Compared Against CWABP}
+All four predictors below share the same window, minimum-sample gate, trust-region clamp (Eq.~\ref{eq:clamp}), and EA fallback -- they differ \emph{only} in how the regression and EA estimates are combined once both are available, which is exactly the comparison this paper needs.
 
-\subsection{Setup}
-We report the repository's default configuration: 25 processes/workload, 3 training / 3 validation / 5 test instances per category (65 paired test workloads total), 600 Q-learning episodes, and random-search tuning budgets of 25/60/20/120 trials for $\alpha$, $(W_{\max},G)$, $q$, and E's thresholds respectively -- each search logs a trial-by-trial best-score-so-far curve to \texttt{results/search\_curve\_*.csv}, so the tuning process itself can be inspected, not just its final choice. This is a deliberately reduced-scale instance of the full protocol (\S VII-F), runnable end-to-end in under a minute; \texttt{-{}-full} and \texttt{-{}-deep} scale every budget up without changing the algorithms (\S VIII).
+\begin{itemize}[leftmargin=1.1em,itemsep=1pt,topsep=2pt]
+\item \textbf{EA}: Eq.~\ref{eq:ea} alone; never uses the feature.
+\item \textbf{Regression-only}: once $m\geq m_{\min}$, uses $\hat\tau_{\mathrm{reg}}$ outright (weight 1); otherwise falls back to EA. Isolates the effect of having a regression at all.
+\item \textbf{Fixed-weight}: blends with a \emph{constant} weight $w\in(0,1)$ chosen on validation data,
+\begin{equation}
+\hat\tau_{\mathrm{fw}} = \exp\!\big(w\ln\hat\tau_{\mathrm{reg}}+(1-w)\ln\hat\tau_{\mathrm{EA}}\big).
+\label{eq:fixedweight}
+\end{equation}
+Isolates whether blending in \emph{some fixed amount} of regression helps, without CWABP's adaptivity.
+\item \textbf{CWABP}: blends with a weight derived from the window's own observed correlation, shrunk by $\lambda$:
+\begin{equation}
+\hat\tau_{\mathrm{CWABP}} = \exp\!\big(\lambda r^2\ln\hat\tau_{\mathrm{reg}}+(1-\lambda r^2)\ln\hat\tau_{\mathrm{EA}}\big).
+\label{eq:cwabp}
+\end{equation}
+\end{itemize}
+Comparing CWABP against regression-only isolates whether \emph{shrinking by correlation at all} helps; comparing it against fixed-weight isolates whether the \emph{adaptive, window-specific} weight is better than a single constant tuned once on validation data.
 
-\subsection{Burst Prediction and Tuned Parameters}
-Linear regression achieved the lowest validation RMSE and supplied predictions to every downstream algorithm. Validation-selected: $\alpha{=}0$ (Weighted ML reduces to shortest-predicted-burst-first on this mixture), $(W_{\max},G){=}(144.9,7)$, fixed RR quantum $q{=}40$.
+\subsection{Information Boundary and No-Future-Information Guarantee}
+Every predictor's prediction for burst $n$ uses only $x_n$ (observable at $n$'s ready time) and bursts $1,\ldots,n-1$; the true length $\tau_n$ is added to history only after that burst completes. This is enforced structurally -- \texttt{predict()} never receives the burst's own true length as an argument -- and verified by a property-based test that mutates a not-yet-observed burst's true length and asserts the prediction for it is unchanged (\S VI-B).
 
-\begin{table*}[ht]
+\subsection{Worked Example}
+Table~\ref{tab:worked} traces three processes through hand-derivable cases, each checked against the implementation to within $10^{-9}$ relative tolerance (\texttt{tests/test\_worked\_example.py}). \textbf{P0} has three prior bursts with an exact log-linear feature relationship ($x{=}[0,1,2]$, $\ln\tau{=}[1,2,3]$, so $b{=}1$, intercept${=}1$, $r{=}1$); predicting burst 3 ($x_3{=}3$) gives $\ln\hat\tau_{\mathrm{reg}}{=}4$ (inside the trust region, unclamped), $\hat\tau_{\mathrm{EA}}{\approx}13.48$ (with $\beta{=}0.5$), and CWABP's weight $\lambda r^2{=}0.5$ blends them to $\hat\tau_{\mathrm{CWABP}}{\approx}27.14$. \textbf{P1} has only one prior burst ($m{=}1<m_{\min}$): every predictor falls back to the EA estimate ($\approx11.0$). \textbf{P2} has three prior bursts with a \emph{constant} feature ($x{=}5$ throughout, $s_{zz}{=}0$): $r$ is defined as $0$ by convention, so the regression component degenerates and every predictor again returns the EA estimate.
+
+\begin{table}[h]
 \centering
-\caption{Mean test-set outcomes across 65 paired workloads (lower is better except Jain's index and utilisation).}
+\caption{Worked example: three hand-derivable cases.}
+\label{tab:worked}
+\scriptsize
+\begin{tabular}{lp{5.7cm}}
+\toprule
+\textbf{Process} & \textbf{Behaviour} \\
+\midrule
+P0 & $m{=}3$, perfect log-linear fit ($r{=}1$): regression activates; CWABP $\approx27.14$, EA $\approx13.48$, regression-only $\approx54.60$. \\
+P1 & $m{=}1<m_{\min}$: all predictors fall back to EA ($\approx11.0$). \\
+P2 & $m{=}3$, constant feature ($s_{zz}{=}0\Rightarrow r{:=}0$): all predictors fall back to EA. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experimental Setup}
+
+\subsection{Simulator and Workloads}
+We reuse the existing event-driven SRTF simulator and its seven synthetic multi-burst, alternating CPU/I-O workload types (8 processes, 14 bursts/process): \emph{stable} ($\rho{=}0.3$), \emph{feature-driven strong} ($\rho{=}0.9$), \emph{feature-driven moderate} ($\rho{=}0.6$), \emph{uncorrelated} ($\rho{\approx}0$), \emph{phase-change} (mid-run shift in mean burst level), \emph{correlation-break} (correlation sign flips mid-run), and \emph{heavy-tailed} bursts. A notable, explainable property of this workload generator: burst-\emph{length} generation depends only on $\sigma$ and the per-process random stream, not on $\rho$ (which only shapes the separate feature channel); consequently EA's metrics are \emph{numerically identical} across the three $\sigma{=}0.3$ workload types (feature-driven strong/moderate, correlation-break) for a given seed, since EA never reads the feature. This is a deliberate controlled-comparison property of the generator, not an error, and we flag it so it is not mistaken for one.
+
+Context-switch cost is fixed at zero throughout, to isolate the effect of the predictor from scheduling overhead; ties are broken by earlier ready time then process ID. The scheduling engine, tie-breaking rules, and workload generator are identical across all four predictors -- only the predictor differs, so any outcome difference is attributable to it.
+
+\subsection{Validation-Based Settings Selection}
+Development, validation, and test seeds are disjoint: validation uses 3 seeds per workload type from $[1{,}000{,}000,2{,}000{,}000)$; test uses 10 fresh seeds per workload type from $[2{,}000{,}000,3{,}000{,}000)$, used exactly once. EA's $\beta$ is selected from $\{0.2,0.5,0.8\}$ and the fixed-weight blend's $w$ from $\{0.25,0.5,0.75\}$, both by lowest mean waiting time averaged over all workload types and validation seeds -- the same rule applied to both. This selected $\beta{=}0.8$ (scores $65.32,64.62,64.54$ for $\beta{=}0.2,0.5,0.8$) and $w{=}0.5$ (scores $61.85,60.88,61.27$). \textbf{CWABP's own settings} (window $8$, shrink $\lambda{=}0.5$, $m_{\min}{=}3$, $\beta{=}0.5$) are \emph{retained unchanged} from prior work on this project rather than re-selected here; their original selection history was not independently documented, so we disclose this as a limitation (\S VI-A) rather than imply CWABP received the same validation-based selection as its baselines.
+
+\section{Results and Discussion}
+
+\subsection{Scheduling Performance}
+Table~\ref{tab:main} reports mean waiting time per predictor per workload type (280 test runs: 4 methods $\times$ 7 workloads $\times$ 10 seeds). Context-switch counts were nearly constant across all methods and workloads (range $167$--$181$), confirming predictor choice has negligible effect on preemption-driven switching overhead at zero switch cost -- so we omit it from the table and report the range here instead.
+
+\begin{table}[h]
+\centering
+\caption{Mean waiting time by predictor and workload (10 test seeds).}
 \label{tab:main}
 \scriptsize
-\setlength{\tabcolsep}{3.0pt}
-\begin{tabular}{lrrrrrr}
-\toprule
-\textbf{Alg} & \textbf{AvgWait} & \textbf{MaxWait} & \textbf{P95Wait} & \textbf{CtxSw} & \textbf{Starv.} & \textbf{Jain} \\
-\midrule
-A & 127.0 & 431.7 & 356.0 & 26.2 & 11.3 & 0.33 \\
-B & \textbf{86.4} & 414.9 & 278.6 & 26.2 & \textbf{7.0} & 0.45 \\
-C & 117.0 & \textbf{317.8} & 281.6 & 26.2 & 12.2 & 0.37 \\
-\midrule
-D & \textbf{147.4} & \textbf{333.6} & \textbf{293.6} & \textbf{33.8} & \textbf{13.7} & 0.41 \\
-E & 166.7 & 423.4 & 347.4 & 76.4 & 13.4 & 0.53 \\
-F & 228.3 & 591.2 & 495.4 & 234.4 & 15.5 & \textbf{0.70} \\
-\bottomrule
-\end{tabular}
-\end{table*}
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.95\linewidth]{fig_main_waiting.pdf}
-\caption{Mean average and maximum waiting time by algorithm, across 65 paired test workloads.}
-\label{fig:main}
-\end{figure}
-
-\subsection{Statistical Comparisons}
-Table~\ref{tab:stats}: paired two-sided Wilcoxon signed-rank tests on per-workload average waiting time, Holm-corrected across the six-comparison family, with a percentile bootstrap (2{,}000 resamples) 95\% CI for the mean ratio.
-
-\begin{table}[h]
-\centering
-\caption{Paired comparisons, average waiting time (Holm-corrected).}
-\label{tab:stats}
-\scriptsize
-\setlength{\tabcolsep}{3.0pt}
-\begin{tabular}{lrrrl}
-\toprule
-\textbf{Comparison} & \textbf{Ratio} & \textbf{95\% CI} & \textbf{$p_{\text{Holm}}$} & \textbf{Result} \\
-\midrule
-B vs.\ A & 0.68 & [0.62, 0.74] & $8.8\!\times\!10^{-10}$ & B faster \\
-C vs.\ B & 1.35 & [1.21, 1.55] & $4.0\!\times\!10^{-7}$ & C slower \\
-C vs.\ A & 0.92 & [0.86, 0.98] & $8.5\!\times\!10^{-5}$ & C faster \\
-E vs.\ D & 1.13 & [1.06, 1.18] & $1.1\!\times\!10^{-3}$ & E slower \\
-F vs.\ D & 1.55 & [1.46, 1.64] & $2.8\!\times\!10^{-11}$ & F slower \\
-F vs.\ E & 1.37 & [1.32, 1.45] & $1.4\!\times\!10^{-11}$ & F slower \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Algorithm B reduced mean waiting time $32\%$ versus A, the strongest result here. C sits between A and B as designed: $35\%$ higher average waiting than B but $8\%$ lower than A, while cutting mean max-waiting from $431.7$ to $317.8$ ($-26\%$) versus A -- yet C's starvation-violation count ($12.2$) was \emph{not} lower than A's ($11.3$) or B's ($7.0$), consistent with the algorithm's own documented guarantee gap (\S IV-C): bounding the \emph{worst} wait is not the same as reducing the \emph{count} of threshold violations. Neither adaptive RR policy beat fixed-quantum RR: E was $13\%$ slower and F $55\%$ slower than D, both significant. We attribute this to the deliberately small pilot-scale search/training budgets (\S VII-F) rather than reading it as evidence that adaptive quantum selection is unhelpful in general, but we report it exactly as measured.
-
-\subsection{CWABP vs.\ Exponential Averaging}
-\begin{table}[h]
-\centering
-\caption{CWABP vs.\ exponential averaging (EA), mean over 10 seeds.}
-\label{tab:cwabp}
-\scriptsize
-\setlength{\tabcolsep}{2.8pt}
+\setlength{\tabcolsep}{3.2pt}
 \begin{tabular}{lrrrr}
 \toprule
-\textbf{Workload type} & \textbf{EA wait} & \textbf{CWABP wait} & \textbf{$\Delta$} & \textbf{RMSE EA$\to$CW} \\
+\textbf{Workload} & \textbf{EA} & \textbf{RegOnly} & \textbf{FixedWt} & \textbf{CWABP} \\
 \midrule
-Stable & 59.0 & 58.2 & $-1.4\%$ & 4.35 $\to$ 4.38 \\
-Feature, strong & 65.6 & 64.1 & $-2.3\%$ & 7.18 $\to$ \textbf{5.38} \\
-Feature, moderate & 65.6 & 64.3 & $-2.0\%$ & 7.18 $\to$ 6.99 \\
-Uncorrelated & 83.4 & 81.6 & $-2.1\%$ & 15.54 $\to$ 15.88 \\
-Phase change & 171.1 & \textbf{161.3} & $\mathbf{-5.7\%}$ & 26.75 $\to$ 25.58 \\
-Correlation break & 65.6 & 64.4 & $-1.8\%$ & 7.18 $\to$ 7.11 \\
-Heavy-tailed & 31.2 & 30.8 & $-1.2\%$ & 12.09 $\to$ 12.16 \\
+Stable & 64.2 & 63.7 & \textbf{62.9} & 63.7 \\
+Feature, strong & 72.7 & 75.9 & 70.5 & \textbf{69.8} \\
+Feature, moderate & 72.7 & 71.7 & \textbf{69.2} & 69.6 \\
+Uncorrelated & 94.5 & 87.1 & \textbf{86.1} & 92.3 \\
+Phase change & 179.8 & \textbf{170.1} & 174.2 & 177.2 \\
+Correlation break & 72.7 & 71.8 & \textbf{67.7} & 71.9 \\
+Heavy-tailed & 48.5 & \textbf{43.4} & 44.3 & 46.7 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+CWABP is the single best method on only one of seven workloads (feature-driven strong). Fixed-weight is best on four; regression-only is best on two. CWABP is, however, never the \emph{worst} method on any workload -- it consistently lands between EA and the stronger ablation, which is itself informative: adaptive weighting prevents CWABP from being actively misled, but it does not reliably find the single best fixed operating point that validation-based tuning can find for a constant weight.
+
+\subsection{Statistical Comparisons}
+Table~\ref{tab:stats} reports CWABP vs.\ EA (the primary, headline comparison): paired per-seed differences in mean waiting time, two-sided Wilcoxon signed-rank tests, Holm-corrected across the 3-comparison family (vs.\ EA, vs.\ regression-only, vs.\ fixed-weight) \emph{within} each workload type, and a percentile bootstrap (2{,}000 resamples) 95\% CI for the mean difference.
+
+\begin{table}[h]
+\centering
+\caption{CWABP vs.\ EA, paired mean-waiting difference (negative = CWABP faster), Holm-corrected within each workload's 3-comparison family.}
+\label{tab:stats}
+\scriptsize
+\setlength{\tabcolsep}{2.6pt}
+\begin{tabular}{lrrrl}
+\toprule
+\textbf{Workload} & \textbf{$\Delta$ wait} & \textbf{95\% CI} & \textbf{$p_{\mathrm{Holm}}$} & \textbf{Verdict} \\
+\midrule
+Stable & $-0.50$ & [$-1.50$,$+0.48$] & $0.98$ & not established \\
+Feature, strong & $-2.87$ & [$-5.03$,$-0.40$] & $0.13$ & CWABP faster \\
+Feature, moderate & $-3.11$ & [$-4.71$,$-1.39$] & $0.06$ & CWABP faster \\
+Uncorrelated & $-2.24$ & [$-4.50$,$+0.25$] & $0.11$ & not established \\
+Phase change & $-2.52$ & [$-5.35$,$-0.01$] & $0.17$ & CWABP faster \\
+Correlation break & $-0.81$ & [$-2.97$,$+1.24$] & $1.00$ & not established \\
+Heavy-tailed & $-1.76$ & [$-2.80$,$-0.82$] & $0.02$ & CWABP faster \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CWABP beats EA with a confidence interval excluding zero on four of seven workloads, all in the expected direction (CWABP faster); on the remaining three the interval includes zero, and we report that plainly as \emph{not established} rather than treating a favourable point estimate as evidence. Against the two stronger ablations (Table~\ref{tab:ablation-summary}), the picture is less favourable to CWABP specifically: regression-only wins on three workloads where CWABP's confidence interval excludes zero in the \emph{other} direction, and fixed-weight wins on three as well (full per-workload numbers for both comparisons are in \texttt{results/cwabp\_focused\_stats.json}).
+
+\begin{table}[h]
+\centering
+\caption{CWABP vs.\ the two stronger ablations, across all 7 workloads.}
+\label{tab:ablation-summary}
+\scriptsize
+\begin{tabular}{lccc}
+\toprule
+\textbf{Comparator} & \textbf{CWABP faster} & \textbf{CWABP slower} & \textbf{Not established} \\
+\midrule
+Regression-only & 1 & 3 & 3 \\
+Fixed-weight & 0 & 3 & 4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+This is the central, honest finding of this study: CWABP's adaptive weighting helps relative to EA, but we find \textbf{no evidence that the adaptivity itself beats a well-tuned constant weight} on this workload mixture -- fixed-weight, selected once on validation data, matches or beats CWABP on every workload where a difference is established. CWABP's advantage over EA appears to come mainly from \emph{blending in regression at all}, not from the specific correlation-based shrinkage rule.
+
+\subsection{Prediction Accuracy vs.\ Scheduling Outcome}
+Figure~\ref{fig:rmse} shows RMSE is not a reliable proxy for waiting-time outcome. On \emph{uncorrelated} workloads, CWABP's RMSE ($18.50$) is close to -- marginally worse than -- fixed-weight's ($18.13$), yet CWABP's mean waiting ($92.3$) is substantially \emph{higher} (worse) than fixed-weight's ($86.1$): two predictors with almost identical prediction accuracy produce clearly different scheduling outcomes. This is consistent with SRTF depending on the \emph{ranking} of ready bursts rather than absolute prediction error: a predictor can be comparably accurate on average while still making the specific ranking errors that matter for scheduling. We did not compute a rank-correlation metric (e.g.\ Spearman) for this study and flag that as a natural extension (\S VI-B) rather than assume MAE/RMSE fully capture what SRTF needs.
 
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.95\linewidth]{fig_cwabp_rmse.pdf}
-\caption{Burst-prediction RMSE, EA vs.\ CWABP, by workload type (mean of 10 seeds).}
-\label{fig:cwabp}
+\caption{Prediction RMSE by method and workload type (10 test seeds).}
+\label{fig:rmse}
 \end{figure}
 
-CWABP matched or modestly improved on EA in every tested condition, with the clearest wins on \emph{feature-driven, strong-correlation} (RMSE $-25\%$) and \emph{phase-change} ($-5.7\%$ waiting time) workloads, and small degradation ($<3\%$ RMSE) on the adversarial \emph{uncorrelated} and \emph{heavy-tailed} cases -- consistent with the trust-region clamp (Eq.~\ref{eq:clamp}) successfully preventing the spurious-correlation failure mode it was designed to guard against.
+\subsection{Behaviour Under a Phase Change}
+Figure~\ref{fig:trace} traces one process's actual and predicted bursts under the phase-change workload (burst level shifts upward at index 12), with CWABP's implied weight $\lambda r^2$ shown below. The weight collapses toward zero immediately after the shift (the window's recent correlation structure, learned under the old regime, briefly fails to predict the new one) before recovering as fresh post-shift observations re-establish a usable correlation. This illustrates the mechanism rather than a general guarantee: Table~\ref{tab:stats} shows CWABP's advantage over EA on the \emph{aggregate} phase-change workload metric is real but modest ($p_{\mathrm{Holm}}{=}0.17$), consistent with the predictor needing several bursts after a shift to recover.
 
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{fig_trace.pdf}
+\caption{One process's actual vs.\ predicted bursts (top) and CWABP's implied weight (bottom) across a phase change at burst index 12 (dotted line).}
+\label{fig:trace}
+\end{figure}
 
-\section{Implementation and Reproducibility}
+\subsection{Research Questions, Answered Directly}
+\textbf{Does CWABP outperform EA?} Yes, on 4/7 workloads with a confidence interval excluding zero; not established on the other 3. \textbf{Does CWABP outperform regression alone?} No -- it is significantly \emph{worse} on 3/7 workloads and significantly better on only 1/7. \textbf{Does adaptive weighting improve on a fixed-weight combination?} No evidence that it does; fixed-weight matches or beats CWABP wherever a difference is established. \textbf{Where does CWABP fail to improve, and why?} On \emph{uncorrelated} and \emph{correlation-break} workloads specifically -- exactly the conditions designed to test whether the shrinkage rule avoids being misled by a window's momentarily-spurious correlation; CWABP does avoid catastrophic failure there (it is never the worst method), but it also does not clearly beat a method that ignores the feature.
 
-\subsection{Open-Source Simulator}
-All six algorithms, five burst-prediction models, the Q-learning agent, and CWABP are implemented in \texttt{schedsim}, a Python package with no modification to any real kernel; the accompanying repository includes the exact code used to produce every table and figure above.
+\section{Limitations, Verification, and Reproducibility}
 
-\subsection{Verification and Testing Suite}
-Beyond empirical metrics, \texttt{schedsim} enforces structural invariants with two complementary layers. \textbf{42 unit/invariant tests} verify: $B(\alpha{=}1)\equiv A$ and $C$-with-safeguards-disabled $\equiv B$, both checked pid-for-pid across the dispatch event log, not merely metric-equal; $G{=}0\Rightarrow$ no priority inversion outside override events; structural absence of burst/priority/arrival leakage in feature matrices; Q-learning state indices bounded in $[0,144)$; a frozen policy is fully deterministic; and analytical bounds for turnaround ($T_i{=}W_i{+}b_i$), Jain's index ($\in[1/n,1]$), and starvation counts ($\in[0,n]$). \textbf{10 Hypothesis property-based suites} re-verify the same class of invariants, but over randomly generated and automatically shrunk inputs (process counts $2$--$40$, arbitrary seeds, all burst/arrival/priority modes, and arbitrary floating-point state inputs) rather than hand-picked cases, including a no-future-information property for CWABP that mutates a not-yet-observed burst's true length and asserts the prediction is unaffected.
+\subsection{Limitations}
+\textbf{CWABP's own hyperparameters} were not selected by the same validation procedure applied to EA and fixed-weight in this revision; they are retained from earlier work on this project, and we could not independently confirm they were originally chosen on held-out data. This asymmetry means the comparison, if anything, is conservative \emph{against} our main finding (a validation-tuned CWABP might narrow or close the gap to fixed-weight) rather than inflating it. \textbf{Ten test seeds per workload} is modest; several confidence intervals are wide enough that \emph{not established} rather than \emph{no effect} is the correct reading, and a larger test set is the most direct way to sharpen these. \textbf{Workloads are synthetic}, with a known, designed feature-burst relationship and a zero context-switch cost assumption; no claim is made about a real operating system's I/O-correlated signals. \textbf{Scope}: this study deliberately excludes Priority Scheduling, Round Robin, and reinforcement-learning-based quantum selection, which were evaluated as a separate, unrelated study in this project's earlier work and are not part of the evidence base here.
 
-\subsection{Continuous Training and Data Flywheel}
-A separate CLI, \texttt{train.py}, lets the burst predictors and the Q-agent keep improving across repeated rounds rather than being refit once on a fixed batch. Each round: (i) an \textbf{append-only pool} (\texttt{schedsim/pool.py}) samples new workloads from seeds strictly disjoint from the evaluation splits and appends their processes to \texttt{training\_pool.csv}; (ii) \textbf{checkpointing} (\texttt{schedsim/checkpoint.py}) refits all five regression models on the accumulated pool, logs validation RMSE to a leaderboard CSV, and atomically promotes the best model to \texttt{predictor\_latest.pkl}; and (iii) the \textbf{Q-agent resumes} from a serialized Q-table (\texttt{qtable\_latest.npz}), continuing its $\varepsilon$-decay schedule from the cumulative episode count rather than restarting. On a 3-round smoke test (20 workloads/round, 200 episodes/round), validation RMSE improved monotonically ($22.27\to21.95\to21.79$) as the pool grew, and the Q-table's cumulative episode count correctly persisted across independent process invocations.
+\subsection{Verification}
+CWABP's information boundary (predictions never use a burst's own true length, only feature values and strictly earlier history) is enforced structurally in \texttt{predict()}'s signature and checked by a property-based test that mutates a not-yet-observed burst's true length and asserts the prediction is unaffected. Insufficient-history and zero-feature-variance fallback behaviour (\S III-E) are each covered by a dedicated worked-example test, hand-derived and checked to $10^{-9}$ relative tolerance. The trust-region clamp (Eq.~\ref{eq:clamp}) is covered by an adversarial test with an out-of-range feature value, which caught a real \texttt{math.exp} overflow during development of the underlying simulator and led to the clamp being expressed in log-space rather than applied after exponentiation.
 
-\subsection{Two Bugs This Project's Own Testing Caught}
-Development surfaced two genuine correctness issues. First, an early CWABP multi-burst generator precomputed arrival times assuming no queueing contention; under real contention this let a process's \emph{own} next burst appear ready before its current one had finished simulating, inflating mean waiting time $\sim\!8\times$ before being fixed via online, completion-time-driven burst generation. Second, a small-window spurious correlation in CWABP could combine with an out-of-range feature value to overflow \texttt{math.exp}; an adversarial unit test caught this and it was fixed with the log-space trust-region clamp (Eq.~\ref{eq:clamp}). Both fixes are reflected in the numbers reported here, and the second is now additionally covered by a Hypothesis property test that searches the clamp's boundary directly.
-
-\subsection{Threats to Validity}
-\textbf{Internal.} Validation workloads are used twice (prediction and scheduler tuning), which can make validation estimates optimistic; the disjoint test split is never touched during either step. \textbf{External.} All workloads are synthetic with a known, designed feature-burst relationship; the main study assumes one burst per process with no I/O (CWABP relaxes this only for its own comparison). Absolute numbers should not be read as transferable to a real kernel -- only relative comparisons, and these remain preliminary at pilot scale. \textbf{Statistical.} Workloads within a category are similar by construction, so reported Wilcoxon tests describe this study's designed mixture, not external real-world traffic.
-
-\subsection{Limitations and Future Work}
-Results here are pilot-scale: smaller sample sizes, search/training budgets, and tuning grids than the full protocol, run via \texttt{-{}-full} or \texttt{-{}-deep} for a larger instance of the identical pipeline (\S VIII) with no change to the algorithms. Planned next steps: a full-scale run; validation against real process traces; a kernel-level prototype to measure real prediction overhead; deep Q-networks once the tabular baseline is well understood at scale; and multi-core scheduling, which this study does not address.
-
-\section{Conclusion}
-At pilot scale, ML-weighted priority scheduling (B) delivered a large, statistically robust reduction in mean waiting time, and its fairness-protected variant (C) delivered a smaller but positive reduction while substantially improving worst-case waiting -- though not, at this operating point, the count of starvation-threshold violations, a nuance the algorithm's own design does not rule out. Neither adaptive Round Robin variant beat the fixed-quantum baseline at this scale, reported without qualification. CWABP matched or modestly improved on exponential averaging across every tested condition, including adversarial ones, attributable to the trust-region safeguard added after the project's own tests surfaced a genuine failure mode. The continuous training flywheel demonstrates that both the predictor and the Q-agent can keep improving with more compute rather than being fixed at a single batch size.
-
-\section*{Data and Code Availability}
-The complete simulator, test suite, and scripts used to produce every result above are released under the MIT license. Structure: \texttt{schedsim/} (\texttt{workload.py}, \texttt{predictors.py}, \texttt{schedulers.py}, \texttt{qlearning.py}, \texttt{cwabp.py}, \texttt{pool.py}, \texttt{checkpoint.py}, \texttt{metrics.py}, \texttt{experiment.py}, \texttt{stats.py}); \texttt{tests/} (42 unit tests + \texttt{test\_properties.py}, 10 Hypothesis suites); \texttt{run\_experiment.py} (generates Tables~\ref{tab:main}--\ref{tab:cwabp}, Figs.~\ref{fig:main}--\ref{fig:cwabp}); \texttt{train.py} (continuous training flywheel); \texttt{paper/} (this \LaTeX{} source).
-
+\subsection{Reproducibility}
+All four predictors, the SRTF simulator, and this study's evaluation protocol are in the accompanying repository: \texttt{schedsim/cwabp.py} (predictors and simulator), \texttt{cwabp\_study.py} (validation sweep, frozen test run, per-run CSV, paired statistics), \texttt{tests/test\_worked\_example.py} and \texttt{tests/test\_cwabp.py} (verification). One command reproduces every table and figure above:
 \begin{quote}\small\ttfamily
 pip install -r requirements.txt\\
-python run\_experiment.py --seed 0 \quad\# reproduce exactly\\
-pytest tests/ -v \quad\# 52 tests\\
-python train.py run --rounds 5 --workloads 50\\
-python run\_experiment.py --deep \quad\# 20k+ Q-learning episodes
+python cwabp\_study.py\\
+pytest tests/test\_cwabp.py tests/test\_worked\_example.py\\
+\phantom{pytest }tests/test\_properties.py -v
 \end{quote}
-No part of the pipeline requires network access, proprietary data, or a license beyond the open-source dependencies in \texttt{requirements.txt} (NumPy, SciPy, scikit-learn, pandas, Hypothesis).
+No part of this pipeline requires network access or proprietary data. CWABP, regression-only, and fixed-weight are implemented directly in NumPy with no external regression library; SciPy supplies the Wilcoxon test, and Hypothesis supplies property-based testing.
 
-\section*{Acknowledgment}
-The authors thank Dr Sudhamani MJ for the plagiarism check on this manuscript, and for guiding and helping us throughout this work, as she is our professor and we are doing this under her supervision.
+\section{Conclusion}
+CWABP significantly reduces SRTF mean waiting time relative to classical exponential averaging on four of seven tested workload types, with no evidence of catastrophic failure on any of the remaining three. However, when compared fairly against two simpler ablations that share its exact window, fallback, and numerical-safety machinery, CWABP does not demonstrate a clear advantage: a regression-only predictor and a fixed constant blend weight each match or beat CWABP wherever a statistically established difference exists. We read this as evidence that \emph{having a regression component at all} is the main source of CWABP's benefit over plain exponential averaging, while the specific correlation-adaptive weighting mechanism -- the part of the method intended to be novel -- is not yet demonstrated to add value beyond what a single well-tuned constant achieves on this workload mixture. We report this as the central, honest finding of this study rather than understating it, consistent with evaluating adaptive weighting on its own terms rather than only against the weakest baseline.
+
+\section*{Data and Code Availability}
+The simulator, all four predictors, the frozen evaluation script, and the full per-run results underlying every table and figure above are released under the MIT license in the accompanying repository, together with the broader (separately scoped) six-algorithm scheduling study this project also produced.
+
+
 
 \balance
 \begin{thebibliography}{9}
@@ -326,13 +266,6 @@ The authors thank Dr Sudhamani MJ for the plagiarism check on this manuscript, a
 \bibitem{dias2017} S. Dias et al., ``A machine learning approach for improving process scheduling: A survey,'' \textit{IJCTT}, vol. 43, no. 1, pp. 1--4, 2017.
 \bibitem{negi2005} A. Negi and P. K. Kishore, ``Applying machine learning techniques to improve Linux process scheduling,'' in \textit{Proc. TENCON}, 2005.
 \bibitem{helmy2015} T. Helmy, S. Al-Azani, and O. Bin-Obaidellah, ``A machine learning-based approach to estimate the CPU-burst time for processes in the computational grids,'' in \textit{Proc. AIMS}, 2015.
-\bibitem{dash2016} A. R. Dash, S. K. Sahu, and S. K. Samantra, ``An optimized round robin CPU scheduling algorithm with dynamic time quantum,'' \textit{IJCSEIT}, vol. 5, no. 2, 2016.
-\bibitem{tajwar2017} M. M. Tajwar et al., ``CPU scheduling with a round robin algorithm based on an effective time slice,'' \textit{J. Inf. Process. Syst.}, vol. 13, no. 4, pp. 941--950, 2017.
-\bibitem{mostafa2020} S. M. Mostafa and H. Amano, ``Dynamic round robin CPU scheduling algorithm based on K-means clustering technique,'' \textit{Appl. Sci.}, vol. 10, no. 15, 2020.
-\bibitem{khan2025} Z. I. Khan, M. Khan, and S. N. M. Shah, ``Agent-based adaptive dynamic round robin (AADRR) scheduling algorithm,'' \textit{IEEE Access}, vol. 13, pp. 18308--18324, 2025.
-\bibitem{han2020} J. Han and S. Lee, ``Performance improvement of Linux CPU scheduler using policy gradient reinforcement learning for Android smartphones,'' \textit{IEEE Access}, vol. 8, 2020.
-\bibitem{li2024} P. Li et al., ``Reinforcement learning for adaptive resource scheduling in complex system environments,'' arXiv:2411.05346, 2024.
-\bibitem{watkins1992} C. J. C. H. Watkins and P. Dayan, ``Q-learning,'' \textit{Machine Learning}, vol. 8, no. 3--4, pp. 279--292, 1992.
 \end{thebibliography}
 
 \end{document}
